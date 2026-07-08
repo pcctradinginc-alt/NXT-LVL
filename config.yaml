@@ -1,0 +1,183 @@
+# NXT LVL — AI Next-Stage Beneficiary Scanner
+# Configuration: universe, stages, scoring weights, thresholds.
+# See CONCEPT.md for the rationale behind these values.
+
+stages:
+  - id: 1
+    name: "Compute / Halbleiter (Training)"
+    tickers: ["NVDA", "AMD", "AVGO", "TSM"]
+    keywords: ["gpu training", "ai chip", "semiconductor", "accelerator", "hbm"]
+
+  - id: 2
+    name: "Datacenter-Infrastruktur"
+    tickers: ["VRT", "DELL", "ANET", "MU", "SMCI"]
+    keywords: ["datacenter", "data center", "server infrastructure", "networking switch", "rack"]
+
+  - id: 3
+    name: "Energie / Kühlung / Netz"
+    tickers: ["VST", "CEG", "GEV", "ETN", "PWR", "MOD"]
+    keywords: ["power", "cooling", "grid", "nuclear", "datacenter energy"]
+
+  - id: 4
+    name: "Inference / Netzwerk / Edge"
+    tickers: ["MRVL", "CRDO", "ALAB", "COHR"]
+    keywords: ["inference", "serving", "vllm", "edge ai", "quantization"]
+
+  - id: 5
+    name: "Software / Agenten / Daten"
+    tickers: ["PLTR", "NOW", "DDOG", "MDB", "SNOW"]
+    keywords: ["agents", "agentic", "rag", "orchestration", "vector database"]
+
+  - id: 6
+    name: "Vertikale KI-Adoption"
+    tickers: ["ISRG", "CRWD", "PANW", "TER"]
+    keywords: ["ai adoption", "vertical ai", "healthcare ai", "cybersecurity ai", "enterprise copilot"]
+
+  - id: 7
+    name: "Robotik / Physical AI"
+    tickers: ["SYM", "ROK", "TER", "TSLA"]
+    keywords: ["robotics", "humanoid", "embodied", "physical ai", "autonomous"]
+
+capex_companies:
+  - MSFT
+  - GOOGL
+  - AMZN
+  - META
+  - ORCL
+  - NVDA
+
+scoring:
+  weights:
+    breadth: 0.20
+    momentum: 0.20
+    stage_fit: 0.15
+    divergence: 0.15
+    option_quality: 0.10
+    emergence: 0.20
+  signal_threshold: 70
+  min_sources: 2
+  cooldown_days: 14
+
+options:
+  dte_min: 90
+  dte_max: 180
+  delta_min: 0.60
+  delta_max: 0.70
+  min_open_interest: 100
+  max_spread_pct: 0.10
+
+tracking:
+  close_after_trading_days: 60
+  close_at_dte: 40
+
+# ---------------------------------------------------------------------------
+# Emergence & Reward Engine (see CONCEPT_EMERGENCE.md)
+# ---------------------------------------------------------------------------
+
+themes:
+  - id: ai_inference
+    name: "AI Inference"
+    keywords: ["inference", "serving", "vllm", "tokens per second", "kv cache"]
+    tickers: ["MRVL", "CRDO", "ARM", "AVGO", "SMCI", "QCOM"]
+
+  - id: dc_cooling
+    name: "Data Center Cooling"
+    keywords: ["liquid cooling", "immersion cooling", "direct-to-chip", "CDU"]
+    tickers: ["VRT", "MOD", "SMCI", "COOL", "MTLS"]
+
+  - id: power_grid
+    name: "Power Grid / Transformers"
+    keywords: ["transformer", "switchgear", "grid interconnect", "substation"]
+    tickers: ["GEV", "ETN", "PWR", "HUBB", "NVT", "VST", "CEG", "POWL"]
+
+  - id: optical_networking
+    name: "Networking / Optical Interconnects"
+    keywords: ["optical interconnect", "co-packaged optics", "800G", "silicon photonics"]
+    tickers: ["COHR", "LITE", "CRDO", "ALAB", "MRVL", "AAOI"]
+
+  - id: hbm_memory
+    name: "HBM / Memory"
+    keywords: ["HBM", "HBM3E", "high bandwidth memory", "memory bandwidth"]
+    tickers: ["MU", "WDC", "STX"]
+
+  - id: custom_silicon
+    name: "Custom Silicon / ASIC"
+    keywords: ["ASIC", "custom silicon", "accelerator", "TPU", "tape-out"]
+    tickers: ["AVGO", "MRVL", "ALAB", "LSCC"]
+
+  - id: edge_ai
+    name: "Edge AI"
+    keywords: ["edge ai", "on-device", "npu", "edge inference"]
+    tickers: ["QCOM", "ARM", "LSCC", "AMBA"]
+
+  - id: ai_security
+    name: "AI Security"
+    keywords: ["ai security", "model security", "prompt injection", "llm firewall"]
+    tickers: ["PANW", "CRWD", "S", "ZS", "OKTA"]
+
+  - id: enterprise_automation
+    name: "Enterprise Automation"
+    keywords: ["agentic workflow", "rpa", "process automation", "ai agents"]
+    tickers: ["NOW", "PLTR", "PATH"]
+
+  - id: ai_workflow_sw
+    name: "AI Workflow Software"
+    keywords: ["orchestration", "llmops", "eval", "observability", "vector database"]
+    tickers: ["DDOG", "MDB", "SNOW", "ESTC"]
+
+  - id: data_infra
+    name: "Data Infrastructure"
+    keywords: ["data infrastructure", "lakehouse", "streaming", "feature store"]
+    tickers: ["SNOW", "MDB", "CFLT"]
+
+entity_aliases:
+  VRT: ["Vertiv"]
+  GEV: ["GE Vernova"]
+  CRDO: ["Credo"]
+  ALAB: ["Astera Labs"]
+  COHR: ["Coherent"]
+  CFLT: ["Confluent"]
+  ESTC: ["Elastic"]
+  S: ["SentinelOne"]
+  ZS: ["Zscaler"]
+  MOD: ["Modine"]
+  HUBB: ["Hubbell"]
+  NVT: ["nVent"]
+  POWL: ["Powell Industries"]
+  LSCC: ["Lattice Semiconductor"]
+  AAOI: ["Applied Optoelectronics"]
+  AMBA: ["Ambarella"]
+  PATH: ["UiPath"]
+
+megacap_exclude: ["NVDA", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "AAPL", "TSLA"]
+
+emergence:
+  baseline_window: 30
+  min_history_for_baseline: 3
+  novelty_window_days: 90
+  min_sources: 2
+  theme_threshold: 60
+  score_weights:
+    frequency: 0.30
+    acceleration: 0.35
+    diversity: 0.20
+    novelty: 0.15
+  edgar_fts:
+    enabled: true
+    forms: "10-K,10-Q,8-K"
+    lookback_days: 90
+
+reward:
+  benchmark_symbol: "SPY"
+  horizons: [30, 60, 90, 180]
+  primary_horizon: 90
+  weight_bounds:
+    min: 0.05
+    max: 0.45
+  step_max: 0.02
+  learning_rate: 0.04
+  reliability_bounds:
+    min: 0.5
+    max: 1.5
+  min_samples: 5
+  overheated_score_threshold: 80

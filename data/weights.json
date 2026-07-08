@@ -1,0 +1,18 @@
+{
+  "feature_weights": {
+    "breadth": 0.2,
+    "momentum": 0.2,
+    "stage_fit": 0.15,
+    "divergence": 0.15,
+    "option_quality": 0.1,
+    "emergence": 0.2
+  },
+  "source_reliability": {
+    "edgar_capex": 1.0,
+    "github_trends": 1.0,
+    "jobs_hn": 1.0,
+    "arxiv_trends": 1.0,
+    "hn_buzz": 1.0
+  },
+  "history": []
+}
