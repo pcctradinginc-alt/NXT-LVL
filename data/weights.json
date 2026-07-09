@@ -14,5 +14,127 @@
     "arxiv_trends": 1.0,
     "hn_buzz": 1.0
   },
-  "history": []
+  "history": [
+    {
+      "date": "2026-07-09",
+      "target": "feature:breadth",
+      "old": 0.2,
+      "new": 0.2,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "feature:momentum",
+      "old": 0.2,
+      "new": 0.2,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "feature:stage_fit",
+      "old": 0.15,
+      "new": 0.15,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "feature:divergence",
+      "old": 0.15,
+      "new": 0.15,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "feature:option_quality",
+      "old": 0.1,
+      "new": 0.1,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "feature:emergence",
+      "old": 0.2,
+      "new": 0.2,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "source:edgar_capex",
+      "old": 1.0,
+      "new": 1.0,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "source:github_trends",
+      "old": 1.0,
+      "new": 1.0,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "source:jobs_hn",
+      "old": 1.0,
+      "new": 1.0,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "source:arxiv_trends",
+      "old": 1.0,
+      "new": 1.0,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    },
+    {
+      "date": "2026-07-09",
+      "target": "source:hn_buzz",
+      "old": 1.0,
+      "new": 1.0,
+      "delta": 0.0,
+      "reason": "skipped: n<min_samples (n=0.0)",
+      "evidence": {
+        "n": 0.0
+      }
+    }
+  ]
 }
