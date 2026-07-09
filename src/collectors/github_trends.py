@@ -12,6 +12,7 @@ calls.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -47,7 +48,7 @@ def collect(stage_keywords: dict[int, list[str]] | None = None) -> dict[str, Any
       {
         "source": "github_trends",
         "top_new_repos": [{"name", "stars", "description", "topics"}, ...],
-        "stage_heat": {stage_id: total_stars_of_top10, ...},
+        "stage_heat": {stage_id: log1p_dampened_star_sum_of_top10, ...},
       }
     """
     result: dict[str, Any] = {"source": "github_trends", "top_new_repos": [], "stage_heat": {}}
@@ -102,8 +103,18 @@ def collect(stage_keywords: dict[int, list[str]] | None = None) -> dict[str, Any
             )
             requests_made += 1
             items = data.get("items", []) if isinstance(data, dict) else []
-            total_stars = sum(item.get("stargazers_count", 0) for item in items[:TOP_REPOS_PER_QUERY])
-            result["stage_heat"][stage_id] = total_stars
+            # Fix 4: log-dampened aggregate instead of a raw star SUM. A raw
+            # sum is a vanity metric easily dominated by one mega-repo (e.g.
+            # a single 20k-star repo swamping nine niche ones); log1p keeps
+            # the relative ordering signal (more/bigger repos -> higher heat)
+            # while heavily compressing outliers, so one breakout repo can no
+            # longer single-handedly decide a stage's momentum score. Deeper
+            # validation of this proxy (vs. actual stage outcomes) is
+            # deferred to the backtest.
+            stage_heat = round(
+                sum(math.log1p(item.get("stargazers_count", 0)) for item in items[:TOP_REPOS_PER_QUERY]), 2
+            )
+            result["stage_heat"][stage_id] = stage_heat
         except Exception as exc:  # noqa: BLE001
             logger.warning("github_trends: stage %s heat search failed: %s", stage_id, exc)
             result["stage_heat"][stage_id] = 0

@@ -4,14 +4,26 @@ data/weights.json schema:
   {
     "feature_weights": {feature: weight, ...},   # e.g. breadth, momentum, ...
     "source_reliability": {source: multiplier, ...},
+    "ledger": {
+      "features": {feature: {"n", "wins", "sum_reward"}, ...},
+      "sources": {source: {"n", "wins", "sum_reward"}, ...},
+    },  # cumulative, consume-once attribution ledger (see src/reward/engine.py)
+    "rewarded_evals": ["<signal_id>:<horizon>", ...],  # consumed eval keys
     "history": [
       {"date", "target", "old", "new", "delta", "reason", "evidence"}, ...
     ]
   }
 
-Every adjustment (and every documented skip) is appended to `history` and
-logged via the standard logging module — this is a rule-based, fully
-explainable system, never a silent optimizer.
+Every adjustment (and every documented skip, logged once) is appended to
+`history` and logged via the standard logging module — this is a rule-based,
+fully explainable system, never a silent optimizer.
+
+`ledger`/`rewarded_evals` make weight adaptation a CONVERGENT function of
+cumulative evidence instead of a per-run nudge: each matured signal-horizon
+evaluation is folded into the ledger exactly once (see
+`engine.accumulate_ledger`), and `engine.recompute_weights` derives weights
+as a deterministic function of that ledger's current totals, so repeated
+runs on unchanged evidence stabilize instead of drifting to the bounds.
 """
 
 from __future__ import annotations
@@ -43,6 +55,8 @@ def load(
         obj = {
             "feature_weights": dict(defaults_feature or {}),
             "source_reliability": dict(defaults_reliability or {}),
+            "ledger": {"features": {}, "sources": {}},
+            "rewarded_evals": [],
             "history": [],
         }
         save(obj, path)
@@ -55,6 +69,10 @@ def load(
             raise ValueError("weights.json did not contain an object")
         data.setdefault("feature_weights", dict(defaults_feature or {}))
         data.setdefault("source_reliability", dict(defaults_reliability or {}))
+        data.setdefault("ledger", {"features": {}, "sources": {}})
+        data["ledger"].setdefault("features", {})
+        data["ledger"].setdefault("sources", {})
+        data.setdefault("rewarded_evals", [])
         data.setdefault("history", [])
         return data
     except Exception as exc:  # noqa: BLE001
@@ -62,6 +80,8 @@ def load(
         return {
             "feature_weights": dict(defaults_feature or {}),
             "source_reliability": dict(defaults_reliability or {}),
+            "ledger": {"features": {}, "sources": {}},
+            "rewarded_evals": [],
             "history": [],
         }
 

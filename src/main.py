@@ -325,12 +325,21 @@ def run(dry_run: bool = False) -> int:
                 reward_cfg,
                 current_emergence_scores=emergence_result.get("all_theme_scores"),
             )
-            ledgers = reward_engine.build_ledgers(
-                signals_for_eval,
-                primary_horizon=int(reward_cfg.get("primary_horizon", 90)),
-                overheated_threshold=float(reward_cfg.get("overheated_score_threshold", 80)),
+            primary_horizon = int(reward_cfg.get("primary_horizon", 90))
+            overheated_threshold = float(reward_cfg.get("overheated_score_threshold", 80))
+            newly = reward_engine.accumulate_ledger(
+                weights_obj, signals_for_eval, primary_horizon, overheated_threshold
             )
-            weights_obj = reward_engine.update_weights(weights_obj, ledgers, reward_cfg)
+            logger.info("Reward engine: %d newly-matured signal evaluation(s) consumed into the ledger", newly)
+            # recompute_weights is deterministic/convergent from the cumulative
+            # ledger, so it is safe (and idempotent once converged) to call
+            # every run, even when `newly == 0`.
+            weights_obj = reward_engine.recompute_weights(
+                weights_obj,
+                reward_cfg,
+                base_feature_weights=settings.scoring_weights,
+                base_reliability={src: 1.0 for src in scoring.ALL_SOURCES},
+            )
             weights_mod.save(weights_obj, WEIGHTS_PATH)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Reward engine evaluation/update failed, continuing: %s", exc)

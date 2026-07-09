@@ -148,10 +148,11 @@ def _evaluate_horizon(
     if benchmark_at_signal and benchmark_at_horizon and benchmark_at_signal != 0:
         benchmark_return = round((benchmark_at_horizon - benchmark_at_signal) / benchmark_at_signal * 100, 2)
         alpha = round(absolute_return - benchmark_return, 2)
-    else:
-        alpha = absolute_return  # no benchmark data -> alpha defaults to absolute return
-
-    hit = bool(alpha > 0)
+    # else: benchmark data unavailable -> benchmark_return/alpha stay None.
+    # Fix 2/8b: do NOT silently fall back to alpha = absolute_return here —
+    # that would quietly redefine "beat the benchmark" as "went up at all".
+    # alpha is informational only; `hit` (below) has its own, option-aware
+    # fallback for the no-benchmark case.
 
     # Max drawdown on underlying closes within [signal_date, target_date].
     window_closes = [
@@ -200,6 +201,21 @@ def _evaluate_horizon(
 
     option_liquidity = _liquidity_bucket(option_idea)
 
+    # Fix 2/8b: `hit` reflects the actual instrument that was recommended.
+    # If a call option was proposed and we could BS-re-check its
+    # profitability, hit means "the option would still be worth more than
+    # entry mid" — not merely "the stock went up" (a stock can rise while
+    # the option, after time decay / delta, is worth less than paid).
+    # Only when there is no option (or it isn't valuable-checkable) do we
+    # fall back to a stock-based definition: beats the benchmark (alpha) if
+    # we have one, else simply "went up".
+    if option_idea and option_profitable is not None:
+        hit = bool(option_profitable)
+        hit_basis = "option"
+    else:
+        hit = bool(alpha > 0) if alpha is not None else bool(absolute_return > 0)
+        hit_basis = "underlying"
+
     # thesis_confirmed: compare current emergence score for the signal's
     # theme (if any) against the score recorded at signal time; otherwise
     # heuristically fall back to alpha > 0.
@@ -220,6 +236,7 @@ def _evaluate_horizon(
         "alpha": alpha,
         "max_drawdown": max_drawdown,
         "hit": hit,
+        "hit_basis": hit_basis,
         "preceded_move": preceded_move,
         "option_profitable": option_profitable,
         "option_liquidity": option_liquidity,

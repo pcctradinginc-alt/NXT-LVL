@@ -269,15 +269,28 @@ def score_divergence(three_month_perf_pct: float | None) -> float:
     """Score based on how much of the move has already happened.
 
     None (no Tradier data, e.g. dry-run) -> neutral 50.
+
+    SIGNED mapping (fix 5): an already-negative 3-month move must NOT score
+    as favorably as a flat/small-up move just because abs() makes them look
+    similar. A stock down 20% is a falling knife, not a coiled spring — it
+    gets a LOW divergence score, not a high one. Mild pullbacks (small
+    negative moves) are still treated as fine, since a modest dip can be
+    healthy digestion rather than a trend reversal.
     """
     if three_month_perf_pct is None:
         return 50.0
-    perf = abs(three_month_perf_pct)
-    if perf < 5:
-        return 100.0
-    if perf < 15:
+    p = three_month_perf_pct
+    if p >= 30:
+        return 10.0
+    if p >= 15:
+        return 40.0
+    if p >= 5:
         return 70.0
-    if perf < 30:
+    if p >= 0:
+        return 100.0
+    if p >= -5:
+        return 70.0
+    if p >= -15:
         return 40.0
     return 10.0
 

@@ -91,6 +91,10 @@ def test_score_divergence_buckets():
     assert scoring.score_divergence(10.0) == 70.0
     assert scoring.score_divergence(20.0) == 40.0
     assert scoring.score_divergence(50.0) == 10.0
+    # Signed mapping (fix 5): downtrends must NOT be rewarded as if they were
+    # "not run up". A falling knife (-20%) scores low, not high.
+    assert scoring.score_divergence(-20.0) == 10.0
+    assert scoring.score_divergence(2.0) == 100.0
 
 
 def test_score_option_quality_neutral_when_missing():
@@ -434,7 +438,7 @@ FAKE_CHAIN = [
         "bid": 9.8,
         "ask": 10.0,
         "open_interest": 500,
-        "greeks": {"delta": 0.65},
+        "greeks": {"delta": 0.65, "mid_iv": 0.42},
     },
     {
         "symbol": "VRT260116C00130000",
@@ -512,6 +516,43 @@ def test_select_option_filters_delta_oi_spread():
     assert result["occ_symbol"] == "VRT260116C00110000"
     assert 0.60 <= result["delta"] <= 0.70
     assert result["open_interest"] >= 100
+
+
+def test_select_option_carries_iv_from_greeks():
+    # Fix 6: the selected option dict must surface the chain's implied
+    # volatility (mid_iv, falling back to smv_vol) so the reward evaluator
+    # can re-price the option with real IV instead of the 0.5 fallback.
+    exp = _future_date_str(150)
+    client = SelectableTradierClient(
+        expirations=[exp],
+        chain=FAKE_CHAIN,
+        quote={"last": 115.0},
+    )
+    result = client.select_option("VRT")
+    assert result is not None
+    assert result["iv"] == pytest.approx(0.42)
+
+
+def test_select_option_iv_falls_back_to_smv_vol():
+    exp = _future_date_str(150)
+    chain = [dict(FAKE_CHAIN[0])]
+    chain[0] = dict(chain[0])
+    chain[0]["greeks"] = {"delta": 0.65, "smv_vol": 0.37}
+    client = SelectableTradierClient(expirations=[exp], chain=chain, quote={"last": 115.0})
+    result = client.select_option("VRT")
+    assert result is not None
+    assert result["iv"] == pytest.approx(0.37)
+
+
+def test_select_option_iv_none_when_greeks_missing():
+    exp = _future_date_str(150)
+    chain = [dict(FAKE_CHAIN[0])]
+    chain[0] = dict(chain[0])
+    chain[0]["greeks"] = {"delta": 0.65}
+    client = SelectableTradierClient(expirations=[exp], chain=chain, quote={"last": 115.0})
+    result = client.select_option("VRT")
+    assert result is not None
+    assert result["iv"] is None
 
 
 def test_select_option_returns_none_when_no_expiration_in_window():
@@ -715,50 +756,206 @@ def test_retroactive_evaluation():
         assert ev["max_drawdown"] >= 0
 
 
-def test_weight_update_bounded_and_logged():
-    weights_obj = {
-        "feature_weights": {"breadth": 0.20, "momentum": 0.20, "stage_fit": 0.15, "divergence": 0.15, "option_quality": 0.10, "emergence": 0.20},
-        "source_reliability": {"edgar_capex": 1.0},
-        "history": [],
+def test_hit_is_option_based():
+    from datetime import date, datetime, timedelta
+
+    # Case A: option_idea present and BS re-check says it's still worth more
+    # than entry mid -> hit True, hit_basis "option" (uses the same rising
+    # underlying / option setup as test_retroactive_evaluation).
+    signal_date = (date.today() - timedelta(days=200)).isoformat()
+    underlying_prices = [100.0 + i * 0.5 for i in range(210)]
+    benchmark_prices = [50.0 for _ in range(210)]
+
+    profitable_signal = {
+        "id": "sig_profitable",
+        "date": signal_date,
+        "ticker": "VRT",
+        "score": 85.0,
+        "thesis": "test",
+        "status": "open",
+        "checkpoints": [],
+        "result": None,
+        "option_idea": {
+            "strike": 120.0,
+            "mid": 5.0,
+            "exp": (date.today() + timedelta(days=60)).isoformat(),
+            "oi": 500,
+            "spread": 0.03,
+        },
+        "benchmark_symbol": "SPY",
+        "horizon_evals": {},
     }
-    reward_cfg = {
+    fake = FakeHistoryTradier(
+        {
+            "VRT": _daily_bars(signal_date, underlying_prices),
+            "SPY": _daily_bars(signal_date, benchmark_prices),
+        }
+    )
+    reward_cfg = {"horizons": [90], "benchmark_symbol": "SPY"}
+    updated = reward_evaluator.evaluate_signals(
+        [profitable_signal], fake, reward_cfg, current_emergence_scores=None,
+        path="/tmp/does_not_matter_signals_a.json",
+    )
+    ev = updated[0]["horizon_evals"]["90"]
+    assert ev["hit"] is True
+    assert ev["hit_basis"] == "option"
+
+    # Case B: the stock rose (absolute_return > 0) but the option itself
+    # (deep OTM strike, high entry mid, little time left at the horizon) is
+    # worth less than what was paid -> option_profitable False -> hit False,
+    # even though the underlying went up. This is exactly the scenario the
+    # old alpha/absolute_return-based `hit` definition got wrong.
+    losing_signal_date = (date.today() - timedelta(days=100)).isoformat()
+    mild_up_prices = [100.0 + i * 0.05 for i in range(110)]  # slow +5% drift
+    flat_benchmark = [50.0 for _ in range(110)]
+    losing_signal = {
+        "id": "sig_losing",
+        "date": losing_signal_date,
+        "ticker": "ZZZ",
+        "score": 70.0,
+        "thesis": "test",
+        "status": "open",
+        "checkpoints": [],
+        "result": None,
+        "option_idea": {
+            "strike": 150.0,  # deep OTM relative to ~100-105 underlying
+            "mid": 3.0,
+            "exp": (datetime.strptime(losing_signal_date, "%Y-%m-%d").date() + timedelta(days=95)).isoformat(),
+            "iv": 0.3,
+        },
+        "benchmark_symbol": "SPY",
+        "horizon_evals": {},
+    }
+    fake2 = FakeHistoryTradier(
+        {
+            "ZZZ": _daily_bars(losing_signal_date, mild_up_prices),
+            "SPY": _daily_bars(losing_signal_date, flat_benchmark),
+        }
+    )
+    updated2 = reward_evaluator.evaluate_signals(
+        [losing_signal], fake2, reward_cfg, current_emergence_scores=None,
+        path="/tmp/does_not_matter_signals_b.json",
+    )
+    ev2 = updated2[0]["horizon_evals"]["90"]
+    assert ev2["abs_return"] > 0  # the stock did go up
+    assert ev2["option_profitable"] is False  # but the option is worth less than paid
+    assert ev2["hit"] is False
+    assert ev2["hit_basis"] == "option"
+
+
+# ---------------------------------------------------------------------------
+# Reward engine: cumulative ledger + convergent weight recomputation
+# ---------------------------------------------------------------------------
+
+def _base_reward_cfg(**overrides):
+    cfg = {
         "weight_bounds": {"min": 0.05, "max": 0.45},
         "reliability_bounds": {"min": 0.5, "max": 1.5},
         "step_max": 0.02,
         "learning_rate": 0.04,
         "min_samples": 5,
     }
-    ledgers = {
-        "features": {
-            # High win rate, n well above min_samples -> should be nudged up.
-            "momentum": {"n": 10, "wins": 9, "sum_alpha": 50.0},
-            # Below min_samples -> must be skipped with a documented reason.
-            "stage_fit": {"n": 2, "wins": 2, "sum_alpha": 5.0},
+    cfg.update(overrides)
+    return cfg
+
+
+def _signal_with_eval(sig_id, horizon, hit, alpha, feature_attribution, source_attribution,
+                       score=50.0, data_quality_score=100.0):
+    return {
+        "id": sig_id,
+        "date": "2026-01-01",
+        "ticker": "XYZ",
+        "score": score,
+        "data_quality_score": data_quality_score,
+        "feature_attribution": feature_attribution,
+        "source_attribution": source_attribution,
+        "horizon_evals": {
+            str(horizon): {"hit": hit, "alpha": alpha, "abs_return": alpha, "hit_basis": "option"}
         },
-        "sources": {},
     }
 
-    old_momentum = weights_obj["feature_weights"]["momentum"]
-    updated = reward_engine.update_weights(weights_obj, ledgers, reward_cfg)
 
-    new_momentum = updated["feature_weights"]["momentum"]
-    # Nudge should be positive and bounded (before renormalization the raw
-    # per-feature step is clipped to step_max; renormalization can shift it
-    # further but must stay within the configured absolute bounds).
-    assert new_momentum >= reward_cfg["weight_bounds"]["min"]
-    assert new_momentum <= reward_cfg["weight_bounds"]["max"]
+def test_reward_ledger_consume_once():
+    weights_obj = {
+        "feature_weights": {"momentum": 0.2},
+        "source_reliability": {"edgar_capex": 1.0},
+        "history": [],
+        "ledger": {"features": {}, "sources": {}},
+        "rewarded_evals": [],
+    }
+    signals = [
+        _signal_with_eval("s1", 90, True, 5.0, {"momentum": 40.0}, ["edgar_capex"]),
+        _signal_with_eval("s2", 90, False, -2.0, {"momentum": 30.0}, ["edgar_capex"]),
+    ]
 
-    total = sum(updated["feature_weights"].values())
-    assert total == pytest.approx(1.0, abs=1e-3)
+    first = reward_engine.accumulate_ledger(weights_obj, signals, primary_horizon=90, overheated_threshold=80.0)
+    assert first == 2
+    n_after_first = weights_obj["ledger"]["features"]["momentum"]["n"]
 
-    history = updated["history"]
-    momentum_entries = [h for h in history if h["target"] == "feature:momentum"]
-    assert momentum_entries, "expected a logged history entry for momentum"
-    assert "win_rate" in momentum_entries[0]["reason"] or "adjusted" in momentum_entries[0]["reason"]
+    second = reward_engine.accumulate_ledger(weights_obj, signals, primary_horizon=90, overheated_threshold=80.0)
+    assert second == 0
+    n_after_second = weights_obj["ledger"]["features"]["momentum"]["n"]
+    assert n_after_second == n_after_first  # cumulative ledger did not double
 
-    skip_entries = [h for h in history if h["target"] == "feature:stage_fit"]
-    assert skip_entries, "expected a logged skip entry for stage_fit"
-    assert "skipped" in skip_entries[0]["reason"]
+
+def test_reward_weights_converge_not_drift():
+    base_feature_weights = {
+        "breadth": 0.20, "momentum": 0.20, "stage_fit": 0.15,
+        "divergence": 0.15, "option_quality": 0.10, "emergence": 0.20,
+    }
+    base_reliability = {src: 1.0 for src in scoring.ALL_SOURCES}
+    weights_obj = {
+        "feature_weights": dict(base_feature_weights),
+        "source_reliability": dict(base_reliability),
+        "history": [],
+        "ledger": {
+            "features": {
+                # High win rate, well above min_samples -> target pulls weight up.
+                "momentum": {"n": 40.0, "wins": 36.0, "sum_reward": 200.0},
+            },
+            "sources": {},
+        },
+        "rewarded_evals": [],
+    }
+    reward_cfg = _base_reward_cfg()
+
+    history_of_momentum = []
+    for _ in range(50):
+        weights_obj = reward_engine.recompute_weights(weights_obj, reward_cfg, base_feature_weights, base_reliability)
+        history_of_momentum.append(weights_obj["feature_weights"]["momentum"])
+
+    # Converges: stabilizes (last two iterations equal) rather than marching
+    # to the bound purely from repeated calls on the same static ledger.
+    assert history_of_momentum[-1] == pytest.approx(history_of_momentum[-2], abs=1e-9)
+    assert history_of_momentum[-1] < reward_cfg["weight_bounds"]["max"]
+    assert history_of_momentum[-1] > base_feature_weights["momentum"]
+
+    momentum_history_entries = [h for h in weights_obj["history"] if h["target"] == "feature:momentum"]
+    assert momentum_history_entries, "expected at least one logged history entry for momentum"
+
+
+def test_reward_skips_when_below_min_samples():
+    base_feature_weights = {
+        "breadth": 0.20, "momentum": 0.20, "stage_fit": 0.15,
+        "divergence": 0.15, "option_quality": 0.10, "emergence": 0.20,
+    }
+    base_reliability = {src: 1.0 for src in scoring.ALL_SOURCES}
+    weights_obj = {
+        "feature_weights": dict(base_feature_weights),
+        "source_reliability": dict(base_reliability),
+        "history": [],
+        "ledger": {
+            "features": {
+                "stage_fit": {"n": 2.0, "wins": 2.0, "sum_reward": 10.0},  # n < min_samples (5)
+            },
+            "sources": {},
+        },
+        "rewarded_evals": [],
+    }
+    reward_cfg = _base_reward_cfg()
+
+    updated = reward_engine.recompute_weights(weights_obj, reward_cfg, base_feature_weights, base_reliability)
+    assert updated["feature_weights"]["stage_fit"] == pytest.approx(base_feature_weights["stage_fit"])
 
 
 def test_report_explains_candidate():

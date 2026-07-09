@@ -208,6 +208,8 @@ class TradierClient:
             if spread_pct > max_spread_pct:
                 continue
 
+            iv = greeks.get("mid_iv") or greeks.get("smv_vol")
+
             eligible.append(
                 {
                     "occ_symbol": opt.get("symbol"),
@@ -221,6 +223,7 @@ class TradierClient:
                     "open_interest": open_interest,
                     "spread_pct": round(spread_pct, 4),
                     "underlying_price": underlying_price,
+                    "iv": iv,
                 }
             )
 
