@@ -70,7 +70,11 @@ def test_score_breadth_counts_only_active_sources():
 
 
 def test_score_breadth_partial_sources():
-    candidate = {"ticker": "VRT", "stage_id": 3, "source_evidence": ["edgar_capex"]}
+    # stage_id=1 has no per-stage activity in FIXTURE_DIGEST for github_trends,
+    # jobs_hn, arxiv_trends, or hn_buzz (none of them have a stage-1 entry), so
+    # only the explicit source_evidence ("edgar_capex", which is also credited
+    # via its stage-agnostic aggregate figure) is counted -> 1/5 sources.
+    candidate = {"ticker": "VRT", "stage_id": 1, "source_evidence": ["edgar_capex"]}
     breadth = scoring.score_breadth(candidate, FIXTURE_DIGEST)
     assert breadth == pytest.approx(20.0)
 
@@ -130,6 +134,78 @@ def test_score_candidates_sorted_and_weighted():
     # above the weaker, wrong-stage, low-conviction competitor.
     assert scored[0]["total_score"] >= 60
     assert scored[1]["total_score"] < scored[0]["total_score"]
+
+
+def test_divergence_affects_ranking():
+    # Two otherwise-identical candidates, differing only in their perf_lookup
+    # entry: a small 3-month move (<5% -> divergence 100) should outrank a
+    # large one (>30% -> divergence 10), proving divergence (pre-gate, via
+    # perf_lookup) actually influences ranking now.
+    candidates = [
+        {
+            "ticker": "AAA",
+            "stage_id": 3,
+            "thesis": "small move",
+            "source_evidence": ["edgar_capex", "github_trends"],
+            "conviction": 0.7,
+        },
+        {
+            "ticker": "BBB",
+            "stage_id": 3,
+            "thesis": "large move",
+            "source_evidence": ["edgar_capex", "github_trends"],
+            "conviction": 0.7,
+        },
+    ]
+    perf_lookup = {"AAA": 2.0, "BBB": 40.0}
+    scored = scoring.score_candidates(candidates, FIXTURE_DIGEST, next_stage=3, perf_lookup=perf_lookup)
+    assert scored[0]["ticker"] == "AAA"
+    assert scored[0]["scores"]["divergence"] == pytest.approx(100.0)
+    assert scored[1]["scores"]["divergence"] == pytest.approx(10.0)
+    assert scored[0]["total_score"] > scored[1]["total_score"]
+
+
+def test_emergence_theme_mapping_boosts():
+    # A candidate mapped to a hot emergent theme (score 80) should outrank an
+    # identical candidate with no theme mapping (neutral 50), all else equal.
+    all_theme_scores = {"enterprise_automation": 80.0}
+    candidates = [
+        {
+            "ticker": "NOW",
+            "stage_id": 3,
+            "thesis": "themed",
+            "source_evidence": ["edgar_capex", "github_trends"],
+            "conviction": 0.7,
+            "theme_id": "enterprise_automation",
+        },
+        {
+            "ticker": "ZZZ",
+            "stage_id": 3,
+            "thesis": "unthemed",
+            "source_evidence": ["edgar_capex", "github_trends"],
+            "conviction": 0.7,
+        },
+    ]
+    scored = scoring.score_candidates(
+        candidates, FIXTURE_DIGEST, next_stage=3, all_theme_scores=all_theme_scores
+    )
+    assert scored[0]["ticker"] == "NOW"
+    assert scored[0]["scores"]["emergence"] == pytest.approx(80.0)
+    assert scored[1]["scores"]["emergence"] == pytest.approx(50.0)
+    assert scored[0]["total_score"] > scored[1]["total_score"]
+
+
+def test_breadth_credits_stage_active_sources():
+    # source_evidence cites only jobs_hn, but stage_id=3 is active (non-zero)
+    # in github_trends, arxiv_trends, hn_buzz, and edgar_capex too, per
+    # FIXTURE_DIGEST -> those should be credited as well, not just the 1
+    # explicitly-cited source.
+    candidate = {"ticker": "VRT", "stage_id": 3, "source_evidence": ["jobs_hn"]}
+    scored = scoring.score_candidate(candidate, FIXTURE_DIGEST, next_stage=3)
+    assert scored["source_count"] >= 3
+    assert scored["scores"]["breadth"] > 20.0
+    credited = scoring._credited_sources(candidate, FIXTURE_DIGEST)
+    assert credited == {"jobs_hn", "github_trends", "arxiv_trends", "hn_buzz", "edgar_capex"}
 
 
 def test_score_candidate_with_good_option_and_divergence_clears_threshold():

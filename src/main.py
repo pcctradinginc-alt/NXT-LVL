@@ -351,6 +351,13 @@ def run(dry_run: bool = False) -> int:
     llm_candidates = llm_result.get("candidates", [])
     next_stage = llm_result.get("next_stage")
 
+    # Normalize LLM-proposed tickers to uppercase so downstream lookups
+    # (watchlist tagging, theme mapping, perf_lookup, option selection) match
+    # the uppercase convention used by the watchlist and theme ticker lists.
+    for cand in llm_candidates:
+        if cand.get("ticker"):
+            cand["ticker"] = str(cand["ticker"]).strip().upper()
+
     # Tag LLM candidates with discovery metadata (watchlist vs. llm-proposed).
     for cand in llm_candidates:
         cand.setdefault(
@@ -397,12 +404,62 @@ def run(dry_run: bool = False) -> int:
 
     candidates = list(merged_by_ticker.values())
 
-    # 8. Scoring (pre-option-selection pass, option_quality neutral at 50)
+    # 7b. Map candidates with no theme_id to the highest-scoring emergent
+    # theme whose ticker list contains them, so score_emergence can pick up
+    # a real (non-neutral) theme score during the pre-gate ranking pass
+    # instead of only after a top_pick has already been chosen. Done for all
+    # runs (dry-run too) — harmless, and keeps offline behavior consistent;
+    # it only actually changes anything once all_theme_scores is populated.
+    for cand in candidates:
+        has_theme_id = cand.get("theme_id") is not None or (
+            isinstance(cand.get("discovery"), dict) and cand["discovery"].get("theme_id") is not None
+        )
+        if has_theme_id:
+            continue
+        ticker = cand.get("ticker")
+        if not ticker:
+            continue
+        matching_theme_ids = [
+            theme.get("id")
+            for theme in settings.themes
+            if ticker in (theme.get("tickers") or [])
+        ]
+        if not matching_theme_ids:
+            continue
+        best_theme_id = max(
+            matching_theme_ids,
+            key=lambda tid: all_theme_scores.get(tid, 0.0),
+        )
+        cand["theme_id"] = best_theme_id
+
+    # 7c. Build perf_lookup (real 3-month performance) BEFORE the ranking
+    # pass so divergence is real during the signal gate, not just after a
+    # top_pick has already been chosen. Fault-tolerant: any failed lookup
+    # stores None, which score_divergence treats as neutral (50). Capped at
+    # 15 tickers to bound API calls. Skipped in dry-run / without Tradier.
+    perf_lookup: dict[str, float | None] = {}
+    if not dry_run and tradier_client is not None:
+        tickers_to_fetch = [c.get("ticker") for c in candidates if c.get("ticker")][:15]
+        for ticker in tickers_to_fetch:
+            try:
+                perf_lookup[ticker] = tradier_client.get_three_month_performance_pct(ticker)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("3-month performance pre-fetch failed for %s: %s", ticker, exc)
+                perf_lookup[ticker] = None
+        logger.info(
+            "Pre-gate perf_lookup: fetched 3-month performance for %d/%d candidates",
+            sum(1 for v in perf_lookup.values() if v is not None),
+            len(tickers_to_fetch),
+        )
+
+    # 8. Scoring (pre-option-selection pass, option_quality neutral at 50;
+    # divergence real when perf_lookup was populated above)
     scored = scoring.score_candidates(
         candidates,
         digest,
         next_stage,
         weights=effective_weights,
+        perf_lookup=perf_lookup,
         all_theme_scores=all_theme_scores,
         reliability=effective_reliability,
     )
@@ -448,10 +505,16 @@ def run(dry_run: bool = False) -> int:
                 logger.warning("Option selection failed for %s: %s", ticker, exc)
                 option = None
 
-            try:
-                three_month_perf = tradier_client.get_three_month_performance_pct(ticker)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("3-month performance lookup failed for %s: %s", ticker, exc)
+            if ticker in perf_lookup:
+                # Already fetched during the pre-gate enrichment pass — avoid
+                # a redundant Tradier call.
+                three_month_perf = perf_lookup[ticker]
+            else:
+                try:
+                    three_month_perf = tradier_client.get_three_month_performance_pct(ticker)
+                    perf_lookup[ticker] = three_month_perf
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("3-month performance lookup failed for %s: %s", ticker, exc)
 
             # Re-score just the top pick with real divergence + option quality
             rescored = scoring.score_candidate(

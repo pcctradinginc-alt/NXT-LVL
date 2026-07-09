@@ -85,9 +85,12 @@ Das LLM liefert Thesen — die Bewertung macht der Code, damit sie reproduzierba
 | Divergenz | 20 % | Signal stark, Kurs noch nicht gelaufen (3-Monats-Performance via Tradier) → noch nicht eingepreist |
 | Options-Qualität | 10 % | Liquidität: Open Interest, Bid-Ask-Spread der Zieloption |
 
-Nur wenn der Top-Kandidat **Score ≥ 70** erreicht UND von **≥ 2 unabhängigen Quellen**
-bestätigt ist, wird ein Signal erzeugt. Sonst: „Kein Trade heute" (kein Signal ist ein
-gültiges Ergebnis — Qualität vor Quantität, das schützt die Hit Rate).
+Divergenz und Emergence werden bereits für **alle** Kandidaten vor dem Signal-Gate berechnet
+(reale 3-Monats-Performance via Tradier und reale Theme-Scores aus der Emergence-Erkennung),
+nicht erst für den bereits ausgewählten Top-Pick — sonst würde die Rangfolge auf neutralen
+Platzhalterwerten basieren. Nur wenn der Top-Kandidat **Score ≥ 60** erreicht UND von
+**≥ 2 unabhängigen Quellen** bestätigt ist, wird ein Signal erzeugt. Sonst: „Kein Trade heute"
+(kein Signal ist ein gültiges Ergebnis — Qualität vor Quantität, das schützt die Hit Rate).
 Cooldown: derselbe Ticker wird frühestens nach 14 Tagen erneut signalisiert.
 
 ### 4. Optionsauswahl (Tradier API, Key vorhanden)

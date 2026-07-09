@@ -54,7 +54,11 @@ scoring:
     divergence: 0.15
     option_quality: 0.10
     emergence: 0.20
-  signal_threshold: 70
+  # Calibrated after the pre-gate enrichment fix (divergence + emergence are
+  # now computed from real data BEFORE the gate, not just for an
+  # already-selected top pick), which lifts realistic scores meaningfully
+  # above the old placeholder-driven baseline. 60 is the new bar.
+  signal_threshold: 60
   min_sources: 2
   cooldown_days: 14
 

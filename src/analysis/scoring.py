@@ -62,19 +62,97 @@ def _active_sources(digest: dict[str, Any]) -> set[str]:
     return active
 
 
+def _stage_keyed_value(block: dict[str, Any], key: str, stage_id: Any) -> Any:
+    """Look up `block[key][stage_id]`, tolerating int/str stage-key mismatches.
+
+    Digests loaded fresh from collectors key stages by int; digests that have
+    been through a JSON round-trip (e.g. reloaded from data/last_digest.json)
+    key them by str. Mirrors the pattern already used in score_momentum.
+    """
+    sub = block.get(key) or {}
+    if stage_id in sub:
+        return sub[stage_id]
+    return sub.get(str(stage_id))
+
+
+def _stage_active_sources(candidate: dict[str, Any], digest: dict[str, Any]) -> set[str]:
+    """Sources showing non-zero signal for the candidate's stage in the digest.
+
+    A source "confirms" a candidate either via explicit LLM source_evidence
+    (handled separately by the caller) or implicitly, when the collector's
+    own per-stage aggregate shows real activity for the candidate's stage.
+    Candidates without a stage_id (rare emergent-only candidates) get no
+    stage-active credit here — they fall back to source_evidence only.
+    """
+    stage_id = candidate.get("stage_id")
+    if stage_id is None:
+        return set()
+
+    active: set[str] = set()
+
+    github = digest.get("github_trends") or {}
+    heat = _stage_keyed_value(github, "stage_heat", stage_id)
+    if isinstance(heat, (int, float)) and heat > 0:
+        active.add("github_trends")
+
+    jobs = digest.get("jobs_hn") or {}
+    job_count = _stage_keyed_value(jobs, "stage_job_counts", stage_id)
+    if isinstance(job_count, (int, float)) and job_count > 0:
+        active.add("jobs_hn")
+
+    arxiv = digest.get("arxiv_trends") or {}
+    paper_count = _stage_keyed_value(arxiv, "stage_paper_counts", stage_id)
+    if isinstance(paper_count, (int, float)) and paper_count > 0:
+        active.add("arxiv_trends")
+
+    hn = digest.get("hn_buzz") or {}
+    buzz = _stage_keyed_value(hn, "stage_buzz", stage_id)
+    if isinstance(buzz, dict) and (
+        (buzz.get("stories") or 0) > 0 or (buzz.get("points") or 0) > 0
+    ):
+        active.add("hn_buzz")
+
+    # edgar_capex has no per-stage breakdown; count it whenever the
+    # aggregate capex figure is present at all (it's a stage-agnostic
+    # macro signal for the whole AI infra buildout).
+    edgar = digest.get("edgar_capex") or {}
+    if edgar.get("aggregate_capex_yoy_pct") is not None:
+        active.add("edgar_capex")
+
+    return active
+
+
+def _credited_sources(
+    candidate: dict[str, Any],
+    digest: dict[str, Any],
+) -> set[str]:
+    """Union of explicit source_evidence and stage-active sources, restricted
+    to sources that are both in ALL_SOURCES and actually active in this run's
+    digest. Shared by score_breadth and score_candidate's source_count so the
+    two never diverge.
+    """
+    active = _active_sources(digest)
+    evidence = set(candidate.get("source_evidence", [])) & active & set(ALL_SOURCES)
+    stage_active = _stage_active_sources(candidate, digest) & active & set(ALL_SOURCES)
+    return evidence | stage_active
+
+
 def score_breadth(
     candidate: dict[str, Any],
     digest: dict[str, Any],
     reliability: dict[str, float] | None = None,
 ) -> float:
-    """Breadth score, optionally weighting each confirming source by its reliability.
+    """Breadth score from real multi-source confirmation.
+
+    A source counts as supporting the candidate if EITHER it is in the
+    candidate's `source_evidence`, OR that source shows non-zero signal for
+    the candidate's stage in the digest (see `_stage_active_sources`).
+    Candidates with no `stage_id` fall back to source_evidence only.
 
     `reliability` maps source name -> multiplier (default 1.0 for every
     source when omitted, preserving the original unweighted behavior).
     """
-    active = _active_sources(digest)
-    evidence = set(candidate.get("source_evidence", []))
-    counted = evidence & active & set(ALL_SOURCES)
+    counted = _credited_sources(candidate, digest)
 
     if not reliability:
         return _clip(len(counted) / len(ALL_SOURCES) * 100)
@@ -87,23 +165,24 @@ def score_breadth(
 def score_emergence(
     candidate: dict[str, Any], all_theme_scores: dict[str, float] | None = None
 ) -> float:
-    """Emergence score of the candidate's associated theme (0-100).
+    """Emergence score of the candidate's associated theme (0-100), as a
+    non-penalizing bonus.
 
-    Looks up candidate["discovery"]["theme_id"] first, then candidate["theme_id"].
-    Returns NEUTRAL_EMERGENCE_SCORE when no theme association or no
-    all_theme_scores lookup is available (e.g. plain watchlist candidates, or
-    callers that don't pass emergence data at all) so this feature never
-    penalizes/boosts candidates it has no information about.
+    Looks up candidate["theme_id"] first, then candidate["discovery"]["theme_id"].
+    When that theme id has a score in `all_theme_scores`, returns
+    max(NEUTRAL_EMERGENCE_SCORE, theme_score) — being in an accelerating theme
+    boosts the candidate, but not being mapped (or the theme scoring low)
+    never drags it below neutral. Returns NEUTRAL_EMERGENCE_SCORE when no
+    theme association or no all_theme_scores lookup is available at all.
     """
     if not all_theme_scores:
         return NEUTRAL_EMERGENCE_SCORE
 
-    theme_id = None
-    discovery = candidate.get("discovery")
-    if isinstance(discovery, dict):
-        theme_id = discovery.get("theme_id")
+    theme_id = candidate.get("theme_id")
     if theme_id is None:
-        theme_id = candidate.get("theme_id")
+        discovery = candidate.get("discovery")
+        if isinstance(discovery, dict):
+            theme_id = discovery.get("theme_id")
 
     if theme_id is None:
         return NEUTRAL_EMERGENCE_SCORE
@@ -111,7 +190,7 @@ def score_emergence(
     score = all_theme_scores.get(theme_id)
     if score is None:
         return NEUTRAL_EMERGENCE_SCORE
-    return _clip(float(score))
+    return _clip(max(NEUTRAL_EMERGENCE_SCORE, float(score)))
 
 
 def score_momentum(candidate: dict[str, Any], digest: dict[str, Any]) -> float:
@@ -285,7 +364,7 @@ def score_candidate(
         "conviction_multiplier": round(multiplier, 3),
     }
     enriched["total_score"] = round(total_score, 1)
-    enriched["source_count"] = len(set(candidate.get("source_evidence", [])) & set(ALL_SOURCES))
+    enriched["source_count"] = len(_credited_sources(candidate, digest))
     return enriched
 
 

@@ -144,7 +144,7 @@ Alle strategischen Parameter — Stufen, Ticker-Universum, Keywords, Scoring-Gew
 Schwellwerte, Options-Filter, Tracking-Regeln — stehen in [`config.yaml`](./config.yaml) und
 lassen sich ohne Code-Änderung anpassen. Wichtige Stellschrauben:
 
-- `scoring.signal_threshold` (Standard 70): Mindest-Score für ein Signal.
+- `scoring.signal_threshold` (Standard 60): Mindest-Score für ein Signal.
 - `scoring.min_sources` (Standard 2): Mindestanzahl unabhängiger Quellen.
 - `scoring.cooldown_days` (Standard 14): Sperrfrist, bevor derselbe Ticker erneut signalisiert
   werden darf.
