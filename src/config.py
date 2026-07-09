@@ -4,7 +4,7 @@ Usage:
     from src.config import load_settings
     settings = load_settings()
     settings.stages            # list of stage dicts from config.yaml
-    settings.gemini_api_key    # from env
+    settings.anthropic_api_key # from env
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class Settings:
     raw: dict[str, Any] = field(default_factory=dict)
 
     # Env-provided secrets / runtime knobs
-    gemini_api_key: str = ""
+    anthropic_api_key: str = ""
     tradier_api_key: str = ""
     tradier_env: str = "prod"
     gmail_app_password: str = ""
@@ -127,7 +127,7 @@ def load_settings(config_path: Path | str | None = None) -> Settings:
 
     return Settings(
         raw=raw,
-        gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
+        anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
         tradier_api_key=os.environ.get("TRADIER_API_KEY", ""),
         tradier_env=os.environ.get("TRADIER_ENV", "prod") or "prod",
         gmail_app_password=os.environ.get("GMAIL_APP_PASSWORD", ""),

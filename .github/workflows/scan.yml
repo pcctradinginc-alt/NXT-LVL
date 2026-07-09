@@ -27,7 +27,7 @@ jobs:
 
       - name: Run scan
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TRADIER_API_KEY: ${{ secrets.TRADIER_API_KEY }}
           TRADIER_ENV: ${{ vars.TRADIER_ENV }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}

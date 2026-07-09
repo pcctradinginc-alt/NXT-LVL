@@ -57,17 +57,17 @@ Alle Collector sind fehlertolerant: Fällt eine Quelle aus, läuft der Rest weit
 ## Pipeline (läuft werktäglich vor US-Börsenöffnung via GitHub Actions)
 
 ```
-Collect (5 Quellen) → Aggregate (lokal, tokensparend) → LLM-Analyse (Gemini Free)
+Collect (5 Quellen) → Aggregate (lokal, tokensparend) → LLM-Analyse (Claude Haiku 4.5)
 → Scoring (deterministisch, im Code) → Optionsauswahl (Tradier) → E-Mail (Gmail SMTP)
 → Track-Record-Update (committed ins Repo)
 ```
 
 ### 1. Aggregation (Kosteneffizienz)
 Rohdaten werden **lokal** zu kompakten Kennzahlen verdichtet (Wachstumsraten, Zähler,
-Top-Listen). Nur dieses Digest (~3–4k Tokens) geht an Gemini — ein einziger LLM-Call pro
-Lauf, weit unter dem Free-Tier-Limit.
+Top-Listen). Nur dieses Digest (~3–4k Tokens) geht an das LLM — ein einziger LLM-Call pro
+Lauf.
 
-### 2. LLM-Analyse (Gemini 2.5 Flash, Free Tier)
+### 2. LLM-Analyse (Claude Haiku 4.5)
 Ein Call mit strukturiertem JSON-Output:
 - Einschätzung der **aktuellen Stufe** des KI-Ausbaus,
 - Identifikation der **nächsten Stufe** (3–12 Monate),
@@ -119,15 +119,15 @@ vollständige, öffentliche Nachvollziehbarkeit.
 |---|---|
 | GitHub Actions (öffentliches Repo, ~5 Min/Werktag) | 0 € |
 | SEC EDGAR, GitHub API, HN/Algolia, arXiv | 0 € (keine Keys) |
-| Gemini 2.5 Flash Free Tier (1 Call/Tag) | 0 € |
+| Claude Haiku 4.5 (1 Call/Tag, $1/$5 pro Mio. Tokens) | ~wenige Cent/Monat |
 | Tradier API (vorhanden) | 0 € |
 | Gmail SMTP | 0 € |
-| **Summe** | **0 €/Monat** |
+| **Summe** | **≈ 0 € (nur LLM-Kosten, wenige Cent/Monat)** |
 
 ### Benötigte GitHub Secrets
 | Secret | Zweck |
 |---|---|
-| `GEMINI_API_KEY` | LLM-Analyse (aistudio.google.com → „Get API key") |
+| `ANTHROPIC_API_KEY` | LLM-Analyse (console.anthropic.com → „API Keys"; Claude Haiku 4.5) |
 | `TRADIER_API_KEY` | Optionsdaten (vorhanden) |
 | `GMAIL_APP_PASSWORD` | Mail-Versand (Google-Konto → Sicherheit → App-Passwörter) |
 | `MAIL_FROM` / `MAIL_TO` | Absender/Empfänger (Gmail-Adresse) |

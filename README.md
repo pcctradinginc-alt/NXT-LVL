@@ -33,8 +33,8 @@ beim Menschen. Siehe [Disclaimer](#disclaimer).
    └──────────────────────────────┬───────────────────────────────────┘
                                     ▼
                     ┌───────────────────────────────┐
-                    │  3. LLM-ANALYSE (Gemini 2.5    │
-                    │     Flash, 1 Call/Tag)          │
+                    │  3. LLM-ANALYSE (Claude Haiku   │
+                    │     4.5, 1 Call/Tag)            │
                     │     -> current_stage,           │
                     │        next_stage, Kandidaten   │
                     └───────────────┬─────────────────┘
@@ -92,7 +92,7 @@ folgende Secrets an:
 
 | Secret | Zweck | Woher? |
 |---|---|---|
-| `GEMINI_API_KEY` | LLM-Analyse | [aistudio.google.com](https://aistudio.google.com) → "Get API key" (kostenloses Konto genügt, Free Tier) |
+| `ANTHROPIC_API_KEY` | LLM-Analyse (Claude Haiku 4.5) | [console.anthropic.com](https://console.anthropic.com) → "API Keys". Pay-as-you-go, aber sehr günstig (~1 Call/Tag ≈ wenige Cent/Monat). |
 | `TRADIER_API_KEY` | Optionsdaten & Kurse | [tradier.com](https://tradier.com) → Konto → API-Zugang → Access Token erzeugen (Brokerage- oder Sandbox-Account) |
 | `GMAIL_APP_PASSWORD` | Mail-Versand | Google-Konto → Sicherheit → 2-Faktor-Auth aktivieren → "App-Passwörter" → neues Passwort für "Mail" erzeugen |
 | `MAIL_FROM` | Absenderadresse | Deine Gmail-Adresse (z.B. `pcctradinginc@gmail.com`) |

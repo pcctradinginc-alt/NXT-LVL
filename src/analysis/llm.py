@@ -1,9 +1,15 @@
-"""Gemini REST client: turns the compact signal digest into stage + candidates.
+"""Anthropic (Claude) REST client: turns the compact signal digest into stage + candidates.
 
-Uses the plain REST API (no SDK). A single call per pipeline run, with
-strict JSON-schema validation of the response and one retry on parse
-failure. In --dry-run mode, `analyze()` is bypassed entirely by main.py in
-favor of `dry_run_stub()`.
+Uses the plain Anthropic Messages REST API (no SDK — consistent with the rest of
+this project, which talks to every service over `requests` to keep the dependency
+surface at just `requests` + `pyyaml`). A single call per pipeline run, with strict
+JSON-schema validation of the response and one retry on parse failure. In
+--dry-run mode, `analyze()` is bypassed entirely by main.py in favor of
+`dry_run_stub()`.
+
+Model: claude-haiku-4-5 (Haiku 4.5) — the cheapest current Claude model
+($1 / $5 per million input/output tokens). At one call per day with a ~3-4k-token
+digest, cost is a few cents per month.
 """
 
 from __future__ import annotations
@@ -16,10 +22,10 @@ from src.http_utils import request_json
 
 logger = logging.getLogger(__name__)
 
-GEMINI_URL_TMPL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-)
-DEFAULT_MODEL = "gemini-2.5-flash"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_VERSION = "2023-06-01"
+DEFAULT_MODEL = "claude-haiku-4-5"
+MAX_TOKENS = 2048
 
 REQUIRED_TOP_LEVEL_FIELDS = ["current_stage", "next_stage", "candidates"]
 REQUIRED_CANDIDATE_FIELDS = ["ticker", "stage_id", "thesis", "source_evidence", "conviction"]
@@ -67,7 +73,7 @@ Respond with STRICT JSON only, matching exactly this schema, no markdown fences,
 
 
 class LLMResponseError(Exception):
-    """Raised when the Gemini response cannot be parsed/validated."""
+    """Raised when the Claude response cannot be parsed/validated."""
 
 
 def _validate(payload: Any) -> dict[str, Any]:
@@ -92,30 +98,52 @@ def _validate(payload: Any) -> dict[str, Any]:
     return payload
 
 
-def _call_gemini(api_key: str, prompt_text: str, model: str) -> str:
-    url = GEMINI_URL_TMPL.format(model=model)
-    body = {
-        "contents": [{"role": "user", "parts": [{"text": prompt_text}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.3},
+def _strip_fences(text: str) -> str:
+    """Defensively strip Markdown code fences the model may add around JSON."""
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        # Drop the opening fence line (``` or ```json) ...
+        newline = stripped.find("\n")
+        if newline != -1:
+            stripped = stripped[newline + 1 :]
+        # ... and the closing fence, if present.
+        if stripped.rstrip().endswith("```"):
+            stripped = stripped.rstrip()[:-3]
+    return stripped.strip()
+
+
+def _call_anthropic(api_key: str, system: str, user_text: str, model: str) -> str:
+    """POST the digest to the Anthropic Messages API and return the raw text reply."""
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
     }
-    response = request_json(
-        "POST",
-        url,
-        params={"key": api_key},
-        json_body=body,
-    )
+    body = {
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.3,
+        "system": system,
+        "messages": [{"role": "user", "content": user_text}],
+    }
+    response = request_json("POST", ANTHROPIC_URL, headers=headers, json_body=body)
     data = response.json()
-    candidates = data.get("candidates", [])
-    if not candidates:
-        raise LLMResponseError("Gemini response had no candidates")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    if not parts:
-        raise LLMResponseError("Gemini response had no content parts")
-    return parts[0].get("text", "")
+
+    if data.get("stop_reason") == "refusal":
+        raise LLMResponseError("Claude declined the request (stop_reason=refusal)")
+
+    content = data.get("content", [])
+    if not content:
+        raise LLMResponseError("Claude response had no content blocks")
+    text_parts = [block.get("text", "") for block in content if block.get("type") == "text"]
+    text = "".join(text_parts).strip()
+    if not text:
+        raise LLMResponseError("Claude response had no text content")
+    return text
 
 
 def analyze(digest: dict[str, Any], api_key: str, model: str = DEFAULT_MODEL) -> dict[str, Any]:
-    """Call Gemini with the digest and return validated JSON, or a safe fallback.
+    """Call Claude with the digest and return validated JSON, or a safe fallback.
 
     On any failure (network, parse, validation) after retry, returns a
     fallback dict with an empty candidate list so main.py can produce a
@@ -129,16 +157,16 @@ def analyze(digest: dict[str, Any], api_key: str, model: str = DEFAULT_MODEL) ->
     }
 
     if not api_key:
-        logger.warning("llm.analyze: no GEMINI_API_KEY configured, returning fallback")
+        logger.warning("llm.analyze: no ANTHROPIC_API_KEY configured, returning fallback")
         return fallback
 
-    prompt_text = SYSTEM_INSTRUCTIONS + "\n\nSignal digest:\n" + json.dumps(digest, ensure_ascii=False)
+    user_text = "Signal digest:\n" + json.dumps(digest, ensure_ascii=False)
 
     last_error: Exception | None = None
     for attempt in range(1, 3):
         try:
-            raw_text = _call_gemini(api_key, prompt_text, model)
-            payload = json.loads(raw_text)
+            raw_text = _call_anthropic(api_key, SYSTEM_INSTRUCTIONS, user_text, model)
+            payload = json.loads(_strip_fences(raw_text))
             validated = _validate(payload)
             logger.info(
                 "llm.analyze: success (attempt %d), current_stage=%s next_stage=%s candidates=%d",
@@ -152,7 +180,7 @@ def analyze(digest: dict[str, Any], api_key: str, model: str = DEFAULT_MODEL) ->
             last_error = exc
             logger.warning("llm.analyze: attempt %d failed: %s", attempt, exc)
             if attempt == 1:
-                prompt_text += (
+                user_text += (
                     "\n\nYour previous response could not be parsed as valid JSON matching the "
                     "schema. Reply again with STRICT JSON only, no markdown fences, no extra text."
                 )

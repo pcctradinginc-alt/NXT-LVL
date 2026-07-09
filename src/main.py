@@ -343,10 +343,10 @@ def run(dry_run: bool = False) -> int:
 
     # 6. LLM analysis (digest now includes emergence_summary, see step 2)
     if dry_run:
-        logger.info("Dry-run: using LLM stub instead of a real Gemini call")
+        logger.info("Dry-run: using LLM stub instead of a real Claude (Haiku) call")
         llm_result = llm.dry_run_stub()
     else:
-        llm_result = llm.analyze(digest, settings.gemini_api_key)
+        llm_result = llm.analyze(digest, settings.anthropic_api_key)
 
     llm_candidates = llm_result.get("candidates", [])
     next_stage = llm_result.get("next_stage")
