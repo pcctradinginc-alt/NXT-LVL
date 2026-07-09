@@ -185,6 +185,18 @@ def detect(
         acceleration_ratio = frequency / max(mean, 1.0)
         novelty = _novelty(stats, min_history_for_baseline, novelty_window_days)
 
+        # Warm-up guard (fix 8b): with too little baseline history, both
+        # acceleration (mean/std ~ 0) and novelty (always 1.0) are spurious —
+        # on the very first runs every theme would look "emergent". Until a
+        # theme has >= min_history_for_baseline prior observations we neutralize
+        # those two components (so all_theme_scores is not inflated, which would
+        # otherwise unfairly boost mapped candidates) and forbid flagging it as
+        # emergent (see is_emergent below).
+        warmed_up = stats["n"] >= min_history_for_baseline
+        if not warmed_up:
+            acceleration_z = 0.0
+            novelty = 0.0
+
         per_theme_raw[theme_id] = {
             "theme": theme,
             "per_source_counts": per_source_counts,
@@ -193,6 +205,7 @@ def detect(
             "acceleration_z": acceleration_z,
             "acceleration_ratio": acceleration_ratio,
             "novelty": novelty,
+            "warmed_up": warmed_up,
         }
 
     max_frequency = max((v["frequency"] for v in per_theme_raw.values()), default=0) or 1
@@ -215,7 +228,11 @@ def detect(
         emergence_score = max(0.0, min(100.0, emergence_score))
         all_theme_scores[theme_id] = round(emergence_score, 1)
 
-        is_emergent = emergence_score >= theme_threshold and raw["source_diversity"] >= min_sources
+        is_emergent = (
+            raw["warmed_up"]
+            and emergence_score >= theme_threshold
+            and raw["source_diversity"] >= min_sources
+        )
 
         if is_emergent:
             confirming_sources = [s for s, c in raw["per_source_counts"].items() if c > 0]

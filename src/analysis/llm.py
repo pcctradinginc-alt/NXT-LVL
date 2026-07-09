@@ -122,7 +122,7 @@ def _call_anthropic(api_key: str, system: str, user_text: str, model: str) -> st
     body = {
         "model": model,
         "max_tokens": MAX_TOKENS,
-        "temperature": 0.3,
+        "temperature": 0.0,  # minimize run-to-run candidate-set variance (weakness 8a)
         "system": system,
         "messages": [{"role": "user", "content": user_text}],
     }

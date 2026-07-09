@@ -616,11 +616,12 @@ EMERGENCE_CFG = {
 
 
 def test_emergence_detects_new_theme():
-    # Baseline has a thin, low-frequency history for dc_cooling (well below
-    # min_history_for_baseline) and no history at all for quiet_theme.
+    # Baseline has a warmed-up, low-frequency history for dc_cooling (>=
+    # min_history_for_baseline observations) and no history for quiet_theme.
     baseline_obj = {
         "themes": {
             "dc_cooling": [
+                {"date": "2026-03-15", "per_source_counts": {"edgar_fts": 1}, "frequency": 1, "source_diversity": 1},
                 {"date": "2026-04-01", "per_source_counts": {"edgar_fts": 1}, "frequency": 1, "source_diversity": 1},
                 {"date": "2026-04-15", "per_source_counts": {"edgar_fts": 1}, "frequency": 1, "source_diversity": 1},
             ]
@@ -653,7 +654,31 @@ def test_emergence_detects_new_theme():
     assert dc_theme["source_diversity"] >= 2
 
     # Baseline should have grown by one observation for dc_cooling.
-    assert len(baseline_obj["themes"]["dc_cooling"]) == 3
+    assert len(baseline_obj["themes"]["dc_cooling"]) == 4
+
+
+def test_emergence_warmup_gate():
+    # Weakness 8b: with no baseline history (cold start), even a very high
+    # current frequency must NOT flag a theme as emergent — acceleration and
+    # novelty are spurious until >= min_history_for_baseline observations exist.
+    baseline_obj = {"themes": {}}
+    digest = {
+        "edgar_fts": {"source": "edgar_fts", "theme_counts": {"dc_cooling": 99, "quiet_theme": 0}},
+        "github_trends": {
+            "source": "github_trends",
+            "top_new_repos": [
+                {"name": "x/liquid-cooling-cdu", "description": "immersion cooling datacenters", "topics": ["cooling"]}
+            ],
+        },
+        "arxiv_trends": {"source": "arxiv_trends", "sample_hot_titles": ["liquid cooling for AI datacenters"]},
+        "hn_buzz": {"source": "hn_buzz", "stage_buzz": {}},
+    }
+    result = emergence_detector.detect(
+        digest, EMERGENCE_THEMES, EMERGENCE_CFG, baseline_obj, entity_aliases={}, megacap_exclude=[]
+    )
+    # No theme may be flagged emergent during warm-up, hence no emergent candidates.
+    assert result["emergent_themes"] == []
+    assert result["emergent_candidates"] == []
 
 
 def test_emergent_candidate_outside_watchlist():
@@ -661,7 +686,15 @@ def test_emergent_candidate_outside_watchlist():
     # check the same way main.py does: membership in stages[].tickers).
     watchlist_tickers = {"VRT"}  # MOD deliberately excluded
 
-    baseline_obj = {"themes": {}}
+    baseline_obj = {
+        "themes": {
+            "dc_cooling": [
+                {"date": "2026-03-15", "per_source_counts": {"edgar_fts": 1}, "frequency": 1, "source_diversity": 1},
+                {"date": "2026-04-01", "per_source_counts": {"edgar_fts": 1}, "frequency": 1, "source_diversity": 1},
+                {"date": "2026-04-15", "per_source_counts": {"edgar_fts": 1}, "frequency": 1, "source_diversity": 1},
+            ]
+        }
+    }
     digest = {
         "edgar_fts": {"source": "edgar_fts", "theme_counts": {"dc_cooling": 40, "quiet_theme": 0}},
         "github_trends": {
