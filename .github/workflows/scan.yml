@@ -41,5 +41,12 @@ jobs:
           git config user.name "nxt-lvl-bot"
           git config user.email "actions@users.noreply.github.com"
           git add data/
-          git diff --cached --quiet || git commit -m "Update signal tracking data [skip ci]"
-          git diff --cached --quiet || git push
+          if git diff --cached --quiet; then
+            echo "No data/ changes to commit."
+          else
+            git commit -m "Update signal tracking data [skip ci]"
+            # Rebase onto any concurrent push (e.g. a code change) before pushing,
+            # so the track record persists instead of failing on non-fast-forward.
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
