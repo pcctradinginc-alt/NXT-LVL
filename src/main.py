@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ LAST_DIGEST_PATH = DATA_DIR / "last_digest.json"
 LAST_EMAIL_PATH = DATA_DIR / "last_email.html"
 BASELINE_PATH = DATA_DIR / "baseline.json"
 WEIGHTS_PATH = DATA_DIR / "weights.json"
+DIGEST_HISTORY_PATH = DATA_DIR / "digest_history.jsonl"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -120,6 +122,67 @@ def write_json(path: Path, data: Any) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False, default=str)
         fh.write("\n")
+
+
+def append_digest_history(
+    path: Path,
+    *,
+    current_stage: int | None,
+    next_stage: int | None,
+    top_pick: dict[str, Any] | None,
+    scored_candidates: list[dict[str, Any]],
+    all_theme_scores: dict[str, float] | None,
+    emergent_themes: list[dict[str, Any]] | None,
+    run_date: str | None = None,
+) -> None:
+    """Append one compact JSON line summarizing this run to `path`.
+
+    This is the substrate for a real FORWARD backtest: a true retroactive
+    backtest of the collector-driven signal logic is impossible (the free
+    data sources are point-in-time and were never archived), but archiving
+    each run's scores now lets src/backtest/calibrate.py measure, once
+    enough history has accumulated, which scoring components actually
+    predicted forward returns.
+
+    Deliberately compact (a few KB per line, NOT the full raw digest) so the
+    file stays cheap to commit daily. Fault-tolerant: any failure here is
+    logged and swallowed, never allowed to break the pipeline. Runs in ALL
+    modes, including dry-run, so offline tests exercise this path too.
+    """
+    try:
+        record = {
+            "date": run_date or date.today().isoformat(),
+            "current_stage": current_stage,
+            "next_stage": next_stage,
+            "top_pick": top_pick.get("ticker") if top_pick else None,
+            "candidates": [
+                {
+                    "ticker": c.get("ticker"),
+                    "total_score": c.get("total_score"),
+                    "scores": {
+                        k: (c.get("scores") or {}).get(k)
+                        for k in (
+                            "breadth",
+                            "momentum",
+                            "stage_fit",
+                            "divergence",
+                            "option_quality",
+                            "emergence",
+                        )
+                    },
+                    "source_count": c.get("source_count"),
+                }
+                for c in scored_candidates
+            ],
+            "all_theme_scores": all_theme_scores or {},
+            "emergent_themes": [t.get("theme_id") for t in (emergent_themes or []) if t.get("theme_id")],
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, default=str))
+            fh.write("\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("append_digest_history failed, continuing: %s", exc)
 
 
 DIGEST_SOURCES = ["edgar_capex", "github_trends", "jobs_hn", "arxiv_trends", "hn_buzz", "edgar_fts"]
@@ -617,6 +680,19 @@ def run(dry_run: bool = False) -> int:
             tracking.load_signals(), reward_cfg.get("horizons", [30, 60, 90, 180])
         ),
     }
+
+    # 12b. Archive this run's scores to data/digest_history.jsonl — the
+    # substrate for a real forward IC calibration once it accumulates (see
+    # src/backtest/calibrate.py). Runs in all modes, including dry-run.
+    append_digest_history(
+        DIGEST_HISTORY_PATH,
+        current_stage=llm_result.get("current_stage"),
+        next_stage=next_stage,
+        top_pick=top_pick,
+        scored_candidates=scored,
+        all_theme_scores=all_theme_scores,
+        emergent_themes=emergence_result.get("emergent_themes", []),
+    )
 
     # 13. Build + send/write email
     result = build_result(

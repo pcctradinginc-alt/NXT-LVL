@@ -116,6 +116,22 @@ ein Signal geschlossen: **Hit = Options-Mittelkurs über Einstieg**. Rollierende
 Ø-P/L stehen in jeder Mail. Die Actions-Pipeline committet die Daten zurück ins Repo —
 vollständige, öffentliche Nachvollziehbarkeit.
 
+## Validierung
+
+Die größte offene Schwäche des Systems: die Scoring-Gewichte wurden nie gegen realisierte
+Renditen validiert. Ein echter retroaktiver Backtest der vollständigen Signal-Logik ist
+**unmöglich**, weil die kostenlosen Datenquellen (GitHub/EDGAR/HN/arXiv) nur den jeweils
+aktuellen Zustand liefern und historisch nie archiviert wurden — es gibt kein Replay von "was
+hätte der Scanner an Tag X gesagt". Statt das zu ignorieren, liefert `src/backtest/` zwei
+ehrliche Antworten: (1) ein **mechanischer Preis-Backtest** (`price_backtest.py`), der auf
+echten historischen Kursen testet, ob die Divergenz-Regel und die Delta-0,60-Strike-Wahl
+strukturell funktionieren — unabhängig von den Collector-Signalen; (2) eine **Forward-IC-
+Kalibrierung** (`calibrate.py`), die die seit `main.py` bei jedem Lauf archivierten Scores
+(`data/digest_history.jsonl`) nutzt, um mit wachsender Historie zu messen, welche
+Scoring-Komponenten tatsächlich Vorhersagekraft haben (Spearman Information Coefficient) —
+das ist der einzige Weg, den Collector-Signal-Edge datenbasiert zu prüfen, und er wird mit
+jedem Tag Betrieb aussagekräftiger. Details: siehe [`README.md`](./README.md#validierung--backtest).
+
 ## Betrieb & Kosten
 
 | Posten | Kosten |

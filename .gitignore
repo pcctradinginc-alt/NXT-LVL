@@ -48,3 +48,4 @@ htmlcov/
 # Runtime artifacts (regenerated each run; not the tracked state files)
 data/last_email.html
 data/last_digest.json
+data/backtest_report.json

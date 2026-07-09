@@ -43,6 +43,48 @@ def bs_call_price(S: float, K: float, T_years: float, r: float, sigma: float) ->
     return max(0.0, call)
 
 
+def bs_call_delta(S: float, K: float, T_years: float, r: float, sigma: float) -> float:
+    """Black-Scholes call delta = N(d1).
+
+    Degenerate cases (at/after expiry, or zero volatility) collapse to the
+    intrinsic-value indicator: 1.0 if the option would finish in the money
+    (S > K), else 0.0.
+    """
+    if T_years <= 0:
+        return 1.0 if S > K else 0.0
+    if sigma <= 0:
+        return 1.0 if S > K else 0.0
+    if S <= 0 or K <= 0:
+        return 0.0
+
+    sqrt_t = math.sqrt(T_years)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T_years) / (sigma * sqrt_t)
+    return _norm_cdf(d1)
+
+
+def solve_strike_for_delta(
+    S: float, target_delta: float, T_years: float, r: float, sigma: float
+) -> float:
+    """Binary-search the strike whose call delta is closest to `target_delta`.
+
+    Delta is monotonically decreasing in strike (higher K -> lower delta), so
+    a simple bisection over K in [0.3*S, 2.0*S] converges quickly. ~40
+    iterations gives ample precision for strike granularity used elsewhere in
+    this project.
+    """
+    low = 0.3 * S
+    high = 2.0 * S
+    for _ in range(40):
+        mid = (low + high) / 2.0
+        delta = bs_call_delta(S, mid, T_years, r, sigma)
+        if delta > target_delta:
+            # Delta too high -> strike too low -> search the upper half.
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
 def estimate_call_value(
     underlying_now: float,
     strike: float,

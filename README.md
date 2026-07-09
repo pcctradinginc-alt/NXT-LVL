@@ -150,6 +150,60 @@ lassen sich ohne Code-Änderung anpassen. Wichtige Stellschrauben:
   werden darf.
 - `options.delta_min` / `delta_max` (Standard 0.60–0.70): Ziel-Delta für die Call-Auswahl.
 
+## Validierung & Backtest
+
+**Ehrliche Ausgangslage:** Die Scoring-Gewichte (`config.yaml` → `scoring.weights`) wurden nie
+gegen realisierte Renditen validiert. Ein echter historischer Backtest der *vollständigen*
+Signal-Logik (Breadth, Momentum, Emergence, ...) ist rückwirkend **nicht möglich** — die
+kostenlosen Datenquellen (GitHub/EDGAR/HN/arXiv) liefern nur den aktuellen Stand ("point-in-time")
+und wurden nie archiviert. Es gibt also kein "Was hätte der Scanner am 1.1.2024 gesagt"-Replay.
+Statt das zu verschweigen, liefert dieses Projekt drei ehrliche Bausteine:
+
+### A) Mechanischer Preis-Backtest (`src/backtest/price_backtest.py`)
+
+Testet auf **echten historischen Kursdaten** die zwei mechanischen Hypothesen, die das Scoring
+kodiert: (1) schlagen Divergenz-Buckets tatsächlich durch — sind Aktien, die seitwärts/leicht
+gelaufen sind, bessere Call-Kandidaten als solche, die schon stark gestiegen sind? (2) ist ein
+leicht-im-Geld-Call (Delta ≈ 0,60) strukturell sinnvoll? Die Optionswerte sind dabei eine
+theoretische Black-Scholes-Neubewertung mit realisierter Volatilität als IV-Proxy (Tradier liefert
+keine historischen Optionsketten) — eine belastbare Näherung, kein echter historischer Fill.
+
+```bash
+# Komplett offline, deterministische synthetische Kursreihen, kein Netzwerk nötig:
+python -m src.backtest --mock
+
+# Live gegen echte Tradier-Historie (braucht TRADIER_API_KEY):
+python -m src.backtest --years 3 --horizon 90 --entry-dte 120 --delta 0.60
+```
+
+Ergebnis wird als Tabelle ausgegeben und nach `data/backtest_report.json` geschrieben.
+**Was das NICHT testet:** die Collector-Signale (Breadth, Momentum, Emergence) — dafür fehlt die
+historische Archivierung der Rohdaten komplett.
+
+### B) Digest-Archivierung (`data/digest_history.jsonl`)
+
+Jeder Lauf (auch `--dry-run`) hängt eine kompakte JSON-Zeile an `data/digest_history.jsonl` an:
+Datum, Stufen-Einschätzung, Top-Pick, alle gescorten Kandidaten mit Einzel-Scores, Theme-Scores.
+Diese Datei ist **nicht** in `.gitignore` (nur `last_email.html`/`last_digest.json` sind
+Laufzeit-Artefakte, die ignoriert werden) — der tägliche GitHub-Actions-Workflow committet
+`data/` automatisch, die Historie wächst also von selbst. Das ist die Grundlage für einen
+**echten Forward-Backtest**, der mit der Zeit entsteht.
+
+### C) Forward-IC-Kalibrierung (`src/backtest/calibrate.py`)
+
+Sobald `digest_history.jsonl` genug gereifte Beobachtungen enthält (Laufdatum älter als der
+Horizont), misst dieses Tool die **Information Coefficient (IC)** — die Spearman-Rangkorrelation
+zwischen jedem Scoring-Bestandteil (breadth, momentum, stage_fit, divergence, option_quality,
+emergence, total_score) und der tatsächlich realisierten Forward-Rendite des Tickers. Ein IC nahe
+0 heißt: diese Komponente hat nicht besser als Zufall sortiert — Kandidat fürs Herunterwichten.
+
+```bash
+python -m src.backtest.calibrate --horizon 90
+```
+
+Mit weniger als 30 gereiften Kandidaten-Beobachtungen gibt das Tool ehrlich
+`insufficient_history` zurück, statt eine Korrelation mit falscher Präzision vorzutäuschen.
+
 ## Track Record
 
 Jedes erzeugte Signal wird in `data/signals.json` gespeichert (Ticker, OCC-Optionssymbol,
