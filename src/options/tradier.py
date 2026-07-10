@@ -247,3 +247,158 @@ class TradierClient:
             best["open_interest"],
         )
         return best
+
+    def select_short_leg(
+        self,
+        symbol: str,
+        expiration: str,
+        target_delta: float = 0.32,
+        min_open_interest: int = 50,
+        max_spread_pct: float = 0.15,
+    ) -> dict[str, Any] | None:
+        """Select a short call leg (for a debit call spread) on the given expiration.
+
+        Among calls with delta <= `target_delta` (staying below the long
+        leg's delta so the spread remains a net debit), sufficient open
+        interest, and a tradable bid/ask within the spread cap, pick the one
+        whose delta is closest to `target_delta`. Fault-tolerant: any
+        failure, empty chain, or no matching call returns None.
+        """
+        try:
+            chain = self.get_chain(symbol, expiration)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "tradier.select_short_leg(%s, %s): chain fetch failed: %s", symbol, expiration, exc
+            )
+            return None
+
+        if not chain:
+            return None
+
+        eligible: list[dict[str, Any]] = []
+        for opt in chain:
+            if opt.get("option_type") != "call":
+                continue
+            greeks = opt.get("greeks") or {}
+            delta = greeks.get("delta")
+            if delta is None or delta > target_delta:
+                continue
+
+            open_interest = opt.get("open_interest") or 0
+            if open_interest < min_open_interest:
+                continue
+
+            bid = opt.get("bid")
+            ask = opt.get("ask")
+            if bid is None or ask is None or bid <= 0 or ask <= 0:
+                continue
+            mid = (bid + ask) / 2
+            if mid <= 0:
+                continue
+            spread_pct = (ask - bid) / mid
+            if spread_pct > max_spread_pct:
+                continue
+
+            eligible.append(
+                {
+                    "occ_symbol": opt.get("symbol"),
+                    "strike": opt.get("strike"),
+                    "mid": round(mid, 4),
+                    "delta": delta,
+                    "open_interest": open_interest,
+                    "spread_pct": round(spread_pct, 4),
+                }
+            )
+
+        if not eligible:
+            logger.info(
+                "tradier.select_short_leg(%s, %s): no call met delta/OI/spread filters",
+                symbol,
+                expiration,
+            )
+            return None
+
+        eligible.sort(key=lambda o: abs(o["delta"] - target_delta))
+        best = eligible[0]
+        logger.info(
+            "tradier.select_short_leg(%s, %s): selected %s strike=%s delta=%.2f oi=%s",
+            symbol,
+            expiration,
+            best["occ_symbol"],
+            best["strike"],
+            best["delta"],
+            best["open_interest"],
+        )
+        return best
+
+    def get_next_earnings_date(self, symbol: str) -> str | None:
+        """Best-effort next earnings date via Tradier's beta fundamentals calendar.
+
+        Many Tradier accounts do not have access to this beta endpoint at
+        all (403/404/empty), and the response shape varies by account tier.
+        This method is therefore deliberately defensive: it recursively
+        scans the parsed JSON for any date-like value attached to an
+        "earnings" marker and returns the earliest upcoming one. On any
+        error, missing access, or unrecognized shape it returns None (logged
+        at debug/info, never raises) — this makes the earnings-trap gate
+        opt-in: inactive when the data is unavailable, never crashes the
+        pipeline.
+        """
+        data = self._get("/beta/markets/fundamentals/calendars", params={"symbols": symbol})
+        if not data:
+            logger.debug(
+                "tradier.get_next_earnings_date(%s): empty/unavailable response (endpoint may not be entitled)",
+                symbol,
+            )
+            return None
+
+        today = date.today()
+        candidates: list[date] = []
+
+        def _looks_like_earnings(node: dict[str, Any]) -> bool:
+            for key in ("event", "event_type", "type", "name", "description"):
+                value = node.get(key)
+                if isinstance(value, str) and "earning" in value.lower():
+                    return True
+                if key == "event_type" and isinstance(value, int) and value == 8:
+                    return True
+            return False
+
+        def _parse_date(value: str) -> date | None:
+            try:
+                return datetime.strptime(value[:10], "%Y-%m-%d").date()
+            except (ValueError, TypeError):
+                return None
+
+        def _walk(node: Any, earnings_context: bool) -> None:
+            if isinstance(node, dict):
+                node_is_earnings = earnings_context or _looks_like_earnings(node)
+                for key, value in node.items():
+                    if (
+                        node_is_earnings
+                        and isinstance(value, str)
+                        and key.lower() in ("date", "begin_date", "begindate", "event_date", "eventdate")
+                    ):
+                        parsed = _parse_date(value)
+                        if parsed and parsed >= today:
+                            candidates.append(parsed)
+                    _walk(value, node_is_earnings)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item, earnings_context)
+
+        try:
+            _walk(data, False)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tradier.get_next_earnings_date(%s): parse failed: %s", symbol, exc)
+            return None
+
+        if not candidates:
+            logger.info(
+                "tradier.get_next_earnings_date(%s): no upcoming earnings event found "
+                "(endpoint may be unavailable for this account)",
+                symbol,
+            )
+            return None
+
+        return min(candidates).isoformat()

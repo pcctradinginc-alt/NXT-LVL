@@ -89,6 +89,102 @@ def _render_track_record(track_record: dict[str, Any]) -> str:
     """
 
 
+def _fmt_num(value: Any, suffix: str = "", decimals: int = 2) -> str:
+    """Format a numeric value for the email, or '-' when not present."""
+    if isinstance(value, (int, float)):
+        return f"{value:.{decimals}f}{suffix}"
+    return "-"
+
+
+def _render_structure(structure: dict[str, Any] | None, earnings_trap: bool = False) -> str:
+    """Render the recommended options structure block (German), or "" if absent."""
+    if not structure:
+        return ""
+
+    kind = structure.get("structure")
+    kind_label = {
+        "long_call": "Long Call",
+        "call_spread": "Call-Spread",
+        "stock": "Aktie (statt Call)",
+    }.get(kind, kind or "unbekannt")
+
+    metrics = structure.get("metrics") or {}
+    reason = structure.get("reason", "")
+    iv_expensive = structure.get("iv_expensive")
+    realized_vol = structure.get("realized_vol")
+
+    rows: list[str] = []
+    rows.append(
+        f"<div class=\"stat-row\"><span class=\"stat-label\">Empfohlene Struktur</span>"
+        f"<span>{kind_label}</span></div>"
+    )
+    if reason:
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">Begründung</span>"
+            f"<span>{reason}</span></div>"
+        )
+
+    break_even = metrics.get("break_even")
+    if break_even is not None:
+        move_pct = metrics.get("break_even_move_pct")
+        move_str = f" ({_fmt_num(move_pct, '%', 1)} Bewegung nötig)" if move_pct is not None else ""
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">Break-even</span>"
+            f"<span>{_fmt_num(break_even, '', 2)}{move_str}</span></div>"
+        )
+
+    # IV expensive? — show IV vs. realized vol when both are available.
+    iv_val = metrics.get("iv")
+    iv_expensive_label = "ja" if iv_expensive else "nein"
+    iv_detail = ""
+    if isinstance(iv_val, (int, float)) and isinstance(realized_vol, (int, float)):
+        iv_detail = f" (IV {_fmt_num(iv_val, '', 2)} vs. realisierte Vola {_fmt_num(realized_vol, '', 2)})"
+    elif isinstance(realized_vol, (int, float)):
+        iv_detail = f" (realisierte Vola {_fmt_num(realized_vol, '', 2)})"
+    if iv_expensive is not None:
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">IV teuer?</span>"
+            f"<span>{iv_expensive_label}{iv_detail}</span></div>"
+        )
+
+    theta_per_day = metrics.get("theta_per_day")
+    if isinstance(theta_per_day, (int, float)):
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">Theta/Tag</span>"
+            f"<span>{_fmt_num(theta_per_day, '', 3)}</span></div>"
+        )
+
+    max_loss = metrics.get("max_loss")
+    if isinstance(max_loss, (int, float)):
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">Max-Verlust (1 Kontrakt)</span>"
+            f"<span>${_fmt_num(max_loss, '', 2)}</span></div>"
+        )
+
+    max_profit = metrics.get("max_profit")
+    if isinstance(max_profit, (int, float)):
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">Max-Gewinn (1 Kontrakt)</span>"
+            f"<span>${_fmt_num(max_profit, '', 2)}</span></div>"
+        )
+
+    warning_html = ""
+    if earnings_trap:
+        warning_html = (
+            "<div class=\"thesis\" style=\"margin-top:8px;color:#f0883e;\">"
+            "&#9888; Earnings-Termin in der frühen Laufzeit der Option &mdash; erhöhtes "
+            "Theta-/IV-Crush-Risiko rund um den Termin.</div>"
+        )
+
+    return f"""
+    <div class="card">
+      <h2>Options-Struktur</h2>
+      {''.join(rows)}
+      {warning_html}
+    </div>
+    """
+
+
 def _render_discovery(discovery: dict[str, Any] | None) -> str:
     """Render the "Warum entdeckt" section, or "" if no discovery data is present."""
     if not discovery:
@@ -287,6 +383,11 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     # when the corresponding data is not present in `result` so older
     # result dicts (without these keys) render exactly as before.
     discovery_html = _render_discovery((top_pick or {}).get("discovery")) if top_pick else ""
+    structure_html = (
+        _render_structure((top_pick or {}).get("structure"), bool((top_pick or {}).get("earnings_trap")))
+        if top_pick
+        else ""
+    )
     risks_html = _render_risks((top_pick or {}).get("risks")) if top_pick else ""
     emergent_themes_html = _render_emergent_themes(result.get("emergent_themes"))
     reward_html = _render_reward_status(result.get("reward"))
@@ -301,6 +402,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
       <div class="thesis">{stage_line}</div>
     </div>
     {top_pick_html}
+    {structure_html}
     {discovery_html}
     {risks_html}
     {top5_html}

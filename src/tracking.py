@@ -107,6 +107,9 @@ def add_signal(
     feature_attribution: dict[str, float] | None = None,
     discovery: dict[str, Any] | None = None,
     emergence_at_signal: float | None = None,
+    structure: dict[str, Any] | None = None,
+    realized_vol: float | None = None,
+    earnings_date: str | None = None,
 ) -> dict[str, Any]:
     """Create and persist a new open signal. Returns the created signal dict.
 
@@ -144,6 +147,10 @@ def add_signal(
         "discovery": discovery or {},
         "emergence_at_signal": emergence_at_signal,
         "horizon_evals": {},
+        # --- Options structure-selection layer (see src/analysis/structures.py) ---
+        "structure": structure,
+        "realized_vol": realized_vol,
+        "earnings_date": earnings_date,
     }
     signals.append(signal)
     save_signals(signals, path)

@@ -69,6 +69,15 @@ options:
   delta_max: 0.70
   min_open_interest: 100
   max_spread_pct: 0.10
+  # Structure-selection layer (deterministic "cost & structure" EV check,
+  # see src/analysis/structures.py): how much richer than realized vol the
+  # option's IV must be before we prefer a call spread over a plain long
+  # call, which delta to target for the spread's short leg, and how close
+  # (as a fraction of the option's own DTE) an earnings date must be to flag
+  # the earnings-trap risk note.
+  max_iv_realized_ratio: 1.6
+  spread_short_delta: 0.32
+  earnings_trap_dte_fraction: 0.34
 
 tracking:
   close_after_trading_days: 60

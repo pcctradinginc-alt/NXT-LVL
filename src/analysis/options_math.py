@@ -62,6 +62,30 @@ def bs_call_delta(S: float, K: float, T_years: float, r: float, sigma: float) ->
     return _norm_cdf(d1)
 
 
+def bs_call_theta(S: float, K: float, T_years: float, r: float, sigma: float) -> float:
+    """Black-Scholes call theta (time decay), expressed per YEAR.
+
+    Callers wanting a per-day figure should divide the result by 365.
+
+    Degenerate cases (at/after expiry, non-positive volatility) return 0.0 —
+    there is no meaningful continuous time-decay rate to report there.
+    """
+    if S <= 0 or K <= 0:
+        return 0.0
+    if T_years <= 0:
+        return 0.0
+    if sigma <= 0:
+        return 0.0
+
+    sqrt_t = math.sqrt(T_years)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T_years) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+
+    pdf_d1 = math.exp(-0.5 * d1 * d1) / math.sqrt(2.0 * math.pi)
+    theta = -(S * pdf_d1 * sigma) / (2.0 * sqrt_t) - r * K * math.exp(-r * T_years) * _norm_cdf(d2)
+    return theta
+
+
 def solve_strike_for_delta(
     S: float, target_delta: float, T_years: float, r: float, sigma: float
 ) -> float:

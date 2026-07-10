@@ -15,7 +15,7 @@ import pytest
 
 os.environ.setdefault("NXT_OFFLINE", "1")
 
-from src.analysis import llm, options_math, scoring
+from src.analysis import llm, options_math, scoring, structures
 from src.emergence import baseline as baseline_mod
 from src.emergence import detector as emergence_detector
 from src.mailer import build_email
@@ -1059,3 +1059,173 @@ def test_config_loads_themes_and_reward():
     assert settings.reward_config.get("benchmark_symbol") == "SPY"
     assert settings.emergence_config.get("theme_threshold") == 60
     assert "NVDA" in settings.megacap_exclude
+
+
+# ---------------------------------------------------------------------------
+# Options structure-selection layer (options_math theta + structures.py)
+# ---------------------------------------------------------------------------
+
+def test_bs_call_theta_negative():
+    # Theta (time decay) of an ATM call is negative: the option loses value as
+    # time passes, all else equal.
+    theta = options_math.bs_call_theta(S=100.0, K=100.0, T_years=0.5, r=0.04, sigma=0.5)
+    assert theta < 0
+    # Degenerate cases collapse to 0.0 rather than raising.
+    assert options_math.bs_call_theta(S=100.0, K=100.0, T_years=0.0, r=0.04, sigma=0.5) == 0.0
+    assert options_math.bs_call_theta(S=100.0, K=100.0, T_years=0.5, r=0.04, sigma=0.0) == 0.0
+
+
+def test_realized_vol():
+    # A gently oscillating price series yields a plausible (clipped) annualized
+    # vol; a too-short series returns None.
+    prices = [100.0 + (2.0 if i % 2 else -2.0) for i in range(80)]
+    rvol = structures.realized_vol(prices)
+    assert rvol is not None
+    assert 0.05 <= rvol <= 3.0
+
+    # Fewer than ~20 usable returns -> None.
+    assert structures.realized_vol([100.0, 101.0, 102.0]) is None
+    assert structures.realized_vol([]) is None
+
+
+def test_iv_expensive():
+    # IV 0.9 vs realized 0.4 at ratio 1.6 -> 0.9 > 0.64 -> expensive.
+    assert structures.iv_expensive(0.9, 0.4, 1.6) is True
+    # IV 0.5 vs realized 0.4 -> 0.5 <= 0.64 -> not expensive.
+    assert structures.iv_expensive(0.5, 0.4, 1.6) is False
+    # Missing inputs -> never expensive.
+    assert structures.iv_expensive(None, 0.4, 1.6) is False
+    assert structures.iv_expensive(0.9, None, 1.6) is False
+
+
+def test_long_call_metrics_break_even():
+    m = structures.long_call_metrics(
+        underlying=100.0, strike=105.0, mid=4.0, delta=0.6, iv=0.5, dte_days=120
+    )
+    assert m["break_even"] == pytest.approx(109.0)  # strike + mid
+    # (109/100 - 1) * 100 = 9.0%
+    assert m["break_even_move_pct"] == pytest.approx(9.0)
+    assert m["max_loss"] == pytest.approx(400.0)  # mid * 100
+    assert m["theta_per_day"] is not None
+    assert m["theta_per_day"] < 0
+
+
+def test_call_spread_metrics():
+    m = structures.call_spread_metrics(
+        underlying=100.0, long_strike=100.0, long_mid=6.0, short_strike=110.0, short_mid=2.0, dte_days=120
+    )
+    assert m is not None
+    assert m["net_debit"] == pytest.approx(4.0)  # 6 - 2
+    assert m["width"] == pytest.approx(10.0)
+    assert m["max_profit"] == pytest.approx(600.0)  # (10 - 4) * 100
+    assert m["max_loss"] == pytest.approx(400.0)  # 4 * 100
+    assert m["break_even"] == pytest.approx(104.0)  # long_strike + net_debit
+    assert m["break_even_move_pct"] == pytest.approx(4.0)
+
+    # Invalid: no short mid.
+    assert structures.call_spread_metrics(100.0, 100.0, 6.0, 110.0, None, 120) is None
+    # Invalid: short strike <= long strike.
+    assert structures.call_spread_metrics(100.0, 100.0, 6.0, 100.0, 2.0, 120) is None
+    # Invalid: non-positive net debit (short mid >= long mid).
+    assert structures.call_spread_metrics(100.0, 100.0, 4.0, 110.0, 4.0, 120) is None
+
+
+def test_choose_structure_branches():
+    cfg = {"max_iv_realized_ratio": 1.6}
+    long_call = {"strike": 100.0, "mid": 6.0, "delta": 0.65, "iv": 0.5, "dte": 120}
+    short_leg = {"strike": 110.0, "mid": 2.0, "delta": 0.32}
+
+    # Not expensive (IV 0.5 vs rvol 0.4 -> 0.5 <= 0.64) -> long_call.
+    not_exp = structures.choose_structure(100.0, long_call, short_leg, 0.4, cfg)
+    assert not_exp["structure"] == "long_call"
+    assert not_exp["iv_expensive"] is False
+    assert "im Rahmen" in not_exp["reason"]
+
+    # Expensive (IV 0.9) + valid short leg -> call_spread.
+    exp_call = dict(long_call, iv=0.9)
+    spread = structures.choose_structure(100.0, exp_call, short_leg, 0.4, cfg)
+    assert spread["structure"] == "call_spread"
+    assert spread["iv_expensive"] is True
+    assert "Call-Spread" in spread["reason"]
+
+    # Expensive + no valid short leg -> stock.
+    stock = structures.choose_structure(100.0, exp_call, None, 0.4, cfg)
+    assert stock["structure"] == "stock"
+    assert stock["iv_expensive"] is True
+    assert "Aktie" in stock["reason"]
+
+
+SHORT_LEG_CHAIN = [
+    {
+        "symbol": "VRT260116C00120000",
+        "option_type": "call",
+        "strike": 120.0,
+        "bid": 5.0,
+        "ask": 5.2,
+        "open_interest": 400,
+        "greeks": {"delta": 0.45},  # above target 0.32 -> excluded
+    },
+    {
+        "symbol": "VRT260116C00135000",
+        "option_type": "call",
+        "strike": 135.0,
+        "bid": 2.4,
+        "ask": 2.6,
+        "open_interest": 300,
+        "greeks": {"delta": 0.31},  # closest to 0.32 and not above target
+    },
+    {
+        "symbol": "VRT260116C00150000",
+        "option_type": "call",
+        "strike": 150.0,
+        "bid": 1.0,
+        "ask": 1.1,
+        "open_interest": 200,
+        "greeks": {"delta": 0.20},  # further from 0.32
+    },
+    {
+        "symbol": "VRT260116C00160000",
+        "option_type": "call",
+        "strike": 160.0,
+        "bid": 0.5,
+        "ask": 0.6,
+        "open_interest": 20,  # too illiquid
+        "greeks": {"delta": 0.30},
+    },
+    {
+        "symbol": "VRT260116P00135000",
+        "option_type": "put",
+        "strike": 135.0,
+        "bid": 2.0,
+        "ask": 2.1,
+        "open_interest": 300,
+        "greeks": {"delta": -0.33},
+    },
+]
+
+
+def test_select_short_leg():
+    exp = _future_date_str(150)
+    client = SelectableTradierClient(expirations=[exp], chain=SHORT_LEG_CHAIN, quote={"last": 115.0})
+    leg = client.select_short_leg("VRT", exp, target_delta=0.32)
+    assert leg is not None
+    # The 0.45-delta call is above target (excluded); the 0.31-delta call is the
+    # closest one not above target 0.32 among eligible (OI, spread) candidates.
+    assert leg["occ_symbol"] == "VRT260116C00135000"
+    assert leg["delta"] == pytest.approx(0.31)
+    assert leg["open_interest"] >= 50
+
+    # No eligible short leg -> None (all too illiquid / above target).
+    illiquid = [
+        {
+            "symbol": "VRT260116C00160000",
+            "option_type": "call",
+            "strike": 160.0,
+            "bid": 0.5,
+            "ask": 0.6,
+            "open_interest": 10,
+            "greeks": {"delta": 0.30},
+        }
+    ]
+    client2 = SelectableTradierClient(expirations=[exp], chain=illiquid, quote={"last": 115.0})
+    assert client2.select_short_leg("VRT", exp, target_delta=0.32) is None

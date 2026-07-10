@@ -49,3 +49,4 @@ htmlcov/
 data/last_email.html
 data/last_digest.json
 data/backtest_report.json
+data/walkforward_report.json

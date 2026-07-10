@@ -18,12 +18,12 @@ import argparse
 import json
 import logging
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from src import tracking
-from src.analysis import llm, scoring
+from src.analysis import llm, scoring, structures
 from src.collectors import arxiv_trends, edgar_capex, edgar_fts, github_trends, hn_buzz, jobs_hn
 from src.config import DATA_DIR, Settings, load_settings
 from src.emergence import baseline as baseline_mod
@@ -557,6 +557,11 @@ def run(dry_run: bool = False) -> int:
     # 10. Option selection + divergence rescoring for the chosen top pick
     option = None
     three_month_perf = None
+    structure = None
+    rvol = None
+    edate = None
+    earnings_trap = False
+    earnings_risk_msg = None
     if top_pick is not None:
         ticker = top_pick["ticker"]
         if dry_run or tradier_client is None:
@@ -576,6 +581,75 @@ def run(dry_run: bool = False) -> int:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Option selection failed for %s: %s", ticker, exc)
                 option = None
+
+            # --- Options structure-selection layer (deterministic EV check) ---
+            # Only meaningful when a long call was actually selected. Every step
+            # degrades to None/skip on any failure, so the plain long-call path
+            # keeps working exactly as before when nothing special applies.
+            closes: list[float] = []
+            if option is not None:
+                try:
+                    hist_start = (date.today() - timedelta(days=130)).strftime("%Y-%m-%d")
+                    history = tradier_client.get_history(ticker, start=hist_start)
+                    closes = [
+                        bar.get("close")
+                        for bar in history
+                        if isinstance(bar, dict) and bar.get("close") is not None
+                    ]
+                    rvol = structures.realized_vol(closes)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("realized_vol computation failed for %s: %s", ticker, exc)
+                    rvol = None
+
+                short_leg = None
+                try:
+                    short_leg = tradier_client.select_short_leg(
+                        ticker,
+                        option["expiration"],
+                        target_delta=opts_cfg.get("spread_short_delta", 0.32),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("select_short_leg failed for %s: %s", ticker, exc)
+                    short_leg = None
+
+                try:
+                    underlying_ref = option.get("underlying_price")
+                    if not underlying_ref and closes:
+                        underlying_ref = closes[-1]
+                    if underlying_ref:
+                        structure = structures.choose_structure(
+                            underlying_ref, option, short_leg, rvol, opts_cfg
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("choose_structure failed for %s: %s", ticker, exc)
+                    structure = None
+
+                # Earnings-trap gate (#16): opt-in, inactive when the earnings
+                # endpoint is unavailable. Never hard-blocks; downgrades the
+                # note and flags a German risk string when an earnings event
+                # falls inside the option's early life (theta/IV-crush trap).
+                try:
+                    edate = tradier_client.get_next_earnings_date(ticker)
+                    if edate and option.get("dte"):
+                        earnings_dt = datetime.strptime(edate, "%Y-%m-%d").date()
+                        days_to_earnings = (earnings_dt - date.today()).days
+                        trap_window = opts_cfg.get("earnings_trap_dte_fraction", 0.34) * option["dte"]
+                        if 0 <= days_to_earnings <= trap_window:
+                            earnings_trap = True
+                            earnings_risk_msg = (
+                                f"Earnings am {edate} liegen innerhalb der frühen Laufzeit der Option "
+                                f"(~{int(trap_window)} Tage) — erhöhtes Theta-/IV-Crush-Risiko rund um den Termin."
+                            )
+                            if structure and structure.get("structure") == "long_call":
+                                structure["earnings_downgrade"] = True
+                                structure["reason"] = (
+                                    structure.get("reason", "")
+                                    + " | Achtung: Earnings-Termin in der frühen Laufzeit — Long Call besonders anfällig."
+                                )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("earnings-trap gate failed for %s: %s", ticker, exc)
+                    edate = None
+                    earnings_trap = False
 
             if ticker in perf_lookup:
                 # Already fetched during the pre-gate enrichment pass — avoid
@@ -608,16 +682,23 @@ def run(dry_run: bool = False) -> int:
             scored.sort(key=lambda c: c["total_score"], reverse=True)
 
         top_pick["option"] = option
+        # Expose the structure recommendation + earnings-trap flag so the
+        # mailer can render them. Absent (None/False) keeps the old rendering.
+        top_pick["structure"] = structure
+        top_pick["earnings_trap"] = bool(earnings_trap)
 
         # 11. Risk flags (rendered by the mailer, computed here).
         data_quality_score = compute_data_quality(digest)
-        top_pick["risks"] = compute_risks(
+        risks = compute_risks(
             top_pick,
             option,
             emergence_result,
             overheated_threshold=float(reward_cfg.get("overheated_score_threshold", 80)),
             data_quality_score=data_quality_score,
         )
+        if earnings_risk_msg:
+            risks.append(earnings_risk_msg)
+        top_pick["risks"] = risks
 
         # Persist the new signal (only for real runs where we'd actually track it)
         if not dry_run:
@@ -668,6 +749,9 @@ def run(dry_run: bool = False) -> int:
                 feature_attribution=feature_attribution,
                 discovery=discovery,
                 emergence_at_signal=emergence_at_signal,
+                structure=structure,
+                realized_vol=rvol,
+                earnings_date=edate,
             )
 
     # 12. Track record stats
