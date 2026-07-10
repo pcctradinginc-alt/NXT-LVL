@@ -15,13 +15,13 @@ import pytest
 
 os.environ.setdefault("NXT_OFFLINE", "1")
 
-from src.analysis import llm, options_math, scoring, structures
+from src.analysis import llm, options_math, phases, scoring, structures
 from src.emergence import baseline as baseline_mod
 from src.emergence import detector as emergence_detector
 from src.mailer import build_email
 from src.options.tradier import TradierClient
 from src import tracking
-from src.main import _cluster_member_count, compute_data_quality
+from src.main import _cluster_member_count, apply_claims_adjustment, compute_data_quality
 from src.reward import engine as reward_engine
 from src.reward import evaluator as reward_evaluator
 from src.reward import weights as weights_mod
@@ -1387,3 +1387,166 @@ def test_mailer_renders_invalidation():
     subject, html = build_email(result)
     assert "ungültig" in html
     assert "XLU" in html
+
+
+# ---------------------------------------------------------------------------
+# Probabilistic phase model (#5) & machine-checkable claims (#18)
+# ---------------------------------------------------------------------------
+
+def test_stage_distribution_sums_to_one():
+    from src.config import load_settings
+
+    settings = load_settings()
+    result = phases.compute_stage_distribution(FIXTURE_DIGEST, settings.stages)
+
+    # Rounded to 4 decimals for the injected digest -> allow a small tolerance.
+    total_prob = sum(result["probabilities"].values())
+    assert total_prob == pytest.approx(1.0, abs=1e-3)
+
+    # FIXTURE_DIGEST's strongest per-stage signal (heat, jobs, arxiv, buzz,
+    # capex) is concentrated on stage 3 -> it should be the most active stage.
+    assert result["current_stage"] == 3
+    assert 0.0 <= result["confidence"] <= 1.0
+    assert result["next_stage"] in result["probabilities"]
+
+
+def test_stage_distribution_empty_digest():
+    from src.config import load_settings
+
+    settings = load_settings()
+    result = phases.compute_stage_distribution({}, settings.stages)
+
+    total_prob = sum(result["probabilities"].values())
+    assert total_prob == pytest.approx(1.0, abs=1e-3)
+
+    n = len(settings.stages)
+    for prob in result["probabilities"].values():
+        assert prob == pytest.approx(1.0 / n, abs=1e-3)
+
+    assert result["confidence"] < 0.2  # no data at all -> low confidence
+    assert result["current_stage"] is not None  # still picks a (arbitrary-tie) stage, never crashes
+
+
+def test_stage_distribution_empty_stages_list_never_crashes():
+    result = phases.compute_stage_distribution(FIXTURE_DIGEST, [])
+    assert result["probabilities"] == {}
+    assert result["current_stage"] is None
+    assert result["next_stage"] is None
+    assert result["confidence"] == 0.0
+
+
+def test_verify_claims_fraction():
+    strong_candidate = {
+        "ticker": "VRT",
+        "stage_id": 3,
+        "claims": [
+            {"source": "jobs_hn", "direction": "up", "reason": "hiring accelerating"},
+            {"source": "hn_buzz", "direction": "high", "reason": "buzz elevated"},
+            {"source": "edgar_capex", "direction": "up", "reason": "capex rising"},
+        ],
+    }
+    cv_strong = phases.verify_claims(strong_candidate, FIXTURE_DIGEST, {})
+    assert cv_strong["total"] == 3
+    assert cv_strong["verified"] == 3
+    assert cv_strong["fraction"] == pytest.approx(1.0)
+
+    # stage_id=1 has zero per-stage activity anywhere in FIXTURE_DIGEST, so
+    # claims about it should fail to verify -> a lower fraction than above.
+    weak_candidate = {
+        "ticker": "ZZZ",
+        "stage_id": 1,
+        "claims": [
+            {"source": "jobs_hn", "direction": "up", "reason": "hiring accelerating"},
+            {"source": "github_trends", "direction": "high", "reason": "repos active"},
+        ],
+    }
+    cv_weak = phases.verify_claims(weak_candidate, FIXTURE_DIGEST, {})
+    assert cv_weak["total"] == 2
+    assert cv_weak["verified"] == 0
+    assert cv_weak["fraction"] < cv_strong["fraction"]
+
+    no_claims_candidate = {"ticker": "AAA", "stage_id": 3}
+    cv_none = phases.verify_claims(no_claims_candidate, FIXTURE_DIGEST, {})
+    assert cv_none["total"] == 0
+    assert cv_none["fraction"] == pytest.approx(1.0)
+
+
+def test_claims_factor_downweights():
+    # Two identical candidates differing only in their claims: GOOD claims a
+    # source that genuinely verifies against FIXTURE_DIGEST for stage 3
+    # (edgar_capex/up: aggregate_capex_yoy_pct=25.0 > 0), BAD claims a source
+    # that doesn't (arxiv_trends/high: stage 3's paper count 8 is below the
+    # {3: 8, 4: 20} median of 14).
+    good = {"ticker": "GOOD", "stage_id": 3, "total_score": 80.0,
+            "claims": [{"source": "edgar_capex", "direction": "up"}]}
+    bad = {"ticker": "BAD", "stage_id": 3, "total_score": 80.0,
+           "claims": [{"source": "arxiv_trends", "direction": "high"}]}
+
+    adjusted = apply_claims_adjustment([good, bad], FIXTURE_DIGEST, {}, claims_conviction_floor=0.5)
+
+    good_after = next(c for c in adjusted if c["ticker"] == "GOOD")
+    bad_after = next(c for c in adjusted if c["ticker"] == "BAD")
+
+    assert good_after["claims_verified"]["fraction"] == pytest.approx(1.0)
+    assert bad_after["claims_verified"]["fraction"] == pytest.approx(0.0)
+    assert good_after["total_score"] == pytest.approx(80.0)  # factor 1.0 -> unchanged
+    assert bad_after["total_score"] == pytest.approx(40.0)  # factor 0.5 -> halved
+    assert bad_after["total_score"] < good_after["total_score"]
+    # Re-sorted descending by the adjusted total_score.
+    assert adjusted[0]["ticker"] == "GOOD"
+
+
+def test_mailer_renders_stage_distribution():
+    result = {
+        "stages_config": [
+            {"id": 2, "name": "Datacenter-Infrastruktur"},
+            {"id": 3, "name": "Energie / Kühlung / Netz"},
+        ],
+        "current_stage": 3,
+        "next_stage": 3,
+        "stage_reasoning": "Capex bleibt erhöht, Energie-Engpässe dominieren zunehmend.",
+        "llm_current_stage": 2,
+        "llm_next_stage": 3,
+        "stage_distribution": {
+            "probabilities": {2: 0.3, 3: 0.7},
+            "activity": {2: 0.2, 3: 0.6},
+            "momentum": {2: 1.0, 3: 5.0},
+            "current_stage": 3,
+            "next_stage": 3,
+            "confidence": 0.62,
+        },
+        "top_pick": None,
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+    }
+    subject, html = build_email(result)
+    assert "%" in html
+    assert "Kühlung" in html
+    assert "LLM-Einschätzung" in html
+
+
+def test_mailer_renders_claims_verified():
+    result = {
+        "stages_config": [{"id": 3, "name": "Energie / Kühlung / Netz"}],
+        "current_stage": 3,
+        "next_stage": 3,
+        "stage_reasoning": "Test reasoning",
+        "top_pick": {
+            "ticker": "VRT",
+            "total_score": 82.5,
+            "thesis": "Cooling demand thesis",
+            "option": {"strike": 120, "expiration": "2026-11-20", "mid": 5.25, "dte": 136, "delta": 0.65},
+            "claims_verified": {"verified": 2, "total": 3, "fraction": 0.667},
+        },
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+    }
+    subject, html = build_email(result)
+    assert "Belege geprüft: 2/3" in html
+
+
+def test_config_claims_conviction_floor_default():
+    from src.config import load_settings
+
+    settings = load_settings()
+    assert settings.claims_conviction_floor == pytest.approx(0.5)

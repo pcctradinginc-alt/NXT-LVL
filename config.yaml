@@ -71,6 +71,11 @@ scoring:
   # rather than a single possibly-noisy outlier.
   cluster_min_members: 2
   cluster_score_bar: 45
+  # Machine-checkable-claims gate (#18): floor of the total_score dampening
+  # factor applied when a candidate's LLM-proposed `claims` don't verify
+  # against the digest (see src/analysis/phases.py verify_claims). A
+  # candidate with no claims at all is unaffected (fraction=1.0 -> factor=1.0).
+  claims_conviction_floor: 0.5
 
 options:
   dte_min: 90

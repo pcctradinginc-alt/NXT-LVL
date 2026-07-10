@@ -43,16 +43,30 @@ research trends, HN story buzz), plus a static 7-stage value-chain model of the 
 6 Vertical AI Adoption
 7 Robotics / Physical AI
 
+The digest also includes a `stage_distribution` object, computed DETERMINISTICALLY BY CODE (not \
+by you) from the same digest metrics: `{"probabilities": {stage_id: prob, ...}, "current_stage": \
+<int>, "next_stage": <int>, "confidence": <float 0-1>}`. This is the system's own quantitative \
+read of which stage is most active right now and which stage is next in line to accelerate. \
+Treat it as authoritative context — the code's `next_stage` value, not your own guess, is what \
+actually drives downstream scoring. Anchor your `current_stage`/`next_stage` answers on it (your \
+answers are used only as a human-readable cross-check) and propose candidates FOR the \
+code-identified next stage; you may add one or two candidates for the stage after that if the \
+distribution shows meaningful probability mass building there too.
+
 Your job:
-1. Determine the CURRENT stage that is most active right now based on the digest.
-2. Determine the NEXT stage (3-12 month horizon) that should benefit next.
-3. Propose 5-10 candidate tickers for the NEXT stage specifically. Explicitly avoid the current \
+1. State the CURRENT and NEXT stage, informed by (and normally matching) `stage_distribution`.
+2. Propose 5-10 candidate tickers for the identified next stage(s). Explicitly avoid the current \
 mega-cap winners (e.g. NVDA, MSFT, GOOGL, AMZN, META) — focus on names that are not yet fully \
 priced in, preferring liquid mid-caps with tradable options relevant to the next stage.
-4. For each candidate, provide: ticker, stage_id (int, the stage this candidate belongs to), a \
+3. For each candidate, provide: ticker, stage_id (int, the stage this candidate belongs to), a \
 1-2 sentence thesis, source_evidence (list of source names from \
 ["edgar_capex","github_trends","jobs_hn","arxiv_trends","hn_buzz"] that support this candidate \
-based on the digest), and conviction (float 0-1).
+based on the digest), conviction (float 0-1), and a `claims` array: concrete, machine-checkable \
+assertions about the digest signals that back your thesis. Each claim is `{"source": "<one of \
+edgar_capex, github_trends, jobs_hn, arxiv_trends, hn_buzz>", "direction": "up"|"high", "reason": \
+"<short phrase>"}`. The code independently re-checks every claim against the raw digest and \
+down-weights candidates whose claims don't hold — so only claim what the digest data actually \
+supports; omit a claim rather than invent one.
 
 Respond with STRICT JSON only, matching exactly this schema, no markdown fences, no extra text:
 {
@@ -65,7 +79,10 @@ Respond with STRICT JSON only, matching exactly this schema, no markdown fences,
       "stage_id": <int>,
       "thesis": "<string>",
       "source_evidence": ["<string>", ...],
-      "conviction": <float 0-1>
+      "conviction": <float 0-1>,
+      "claims": [
+        {"source": "<string>", "direction": "up"|"high", "reason": "<string>"}
+      ]
     }
   ]
 }
@@ -94,6 +111,16 @@ def _validate(payload: Any) -> dict[str, Any]:
         for field_name in REQUIRED_CANDIDATE_FIELDS:
             if field_name not in candidate:
                 raise LLMResponseError(f"Candidate missing required field: {field_name}")
+
+        # `claims` (#18) is OPTIONAL: tolerate LLMs that omit it entirely
+        # (default to []), but if present it must be a list of objects so
+        # phases.verify_claims never has to guard against malformed shapes.
+        if "claims" in candidate:
+            claims = candidate["claims"]
+            if not isinstance(claims, list) or not all(isinstance(c, dict) for c in claims):
+                raise LLMResponseError("candidate.claims must be a list of objects")
+        else:
+            candidate["claims"] = []
 
     return payload
 
@@ -208,6 +235,10 @@ def dry_run_stub() -> dict[str, Any]:
                 ),
                 "source_evidence": ["edgar_capex", "github_trends"],
                 "conviction": 0.75,
+                "claims": [
+                    {"source": "edgar_capex", "direction": "up", "reason": "capex rising"},
+                    {"source": "github_trends", "direction": "high", "reason": "cooling repos active"},
+                ],
             },
             {
                 "ticker": "MOD",
@@ -218,6 +249,10 @@ def dry_run_stub() -> dict[str, Any]:
                 ),
                 "source_evidence": ["edgar_capex", "jobs_hn"],
                 "conviction": 0.65,
+                "claims": [
+                    {"source": "edgar_capex", "direction": "up", "reason": "capex rising"},
+                    {"source": "jobs_hn", "direction": "up", "reason": "hiring accelerating for this stage"},
+                ],
             },
             {
                 "ticker": "GEV",
@@ -228,6 +263,10 @@ def dry_run_stub() -> dict[str, Any]:
                 ),
                 "source_evidence": ["edgar_capex", "hn_buzz", "arxiv_trends"],
                 "conviction": 0.7,
+                "claims": [
+                    {"source": "hn_buzz", "direction": "high", "reason": "grid/power discussion buzz elevated"},
+                    {"source": "arxiv_trends", "direction": "high", "reason": "research volume for this stage elevated"},
+                ],
             },
         ],
     }

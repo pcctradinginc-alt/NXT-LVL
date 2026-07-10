@@ -81,6 +81,16 @@ class Settings:
         return float(self.scoring.get("cluster_score_bar", 45))
 
     @property
+    def claims_conviction_floor(self) -> float:
+        """Machine-checkable-claims gate (#18): floor of the total_score dampening
+
+        factor applied to a candidate whose claims fail to verify against the
+        digest (fraction=0.0 -> factor=floor; fraction=1.0 -> factor=1.0, i.e.
+        unchanged). Never zeroes a candidate out entirely.
+        """
+        return float(self.scoring.get("claims_conviction_floor", 0.5))
+
+    @property
     def options_config(self) -> dict[str, Any]:
         return self.raw.get("options", {})
 

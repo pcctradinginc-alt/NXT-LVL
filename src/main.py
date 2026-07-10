@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from src import tracking
-from src.analysis import llm, scoring, structures
+from src.analysis import llm, phases, scoring, structures
 from src.collectors import arxiv_trends, edgar_capex, edgar_fts, github_trends, hn_buzz, jobs_hn
 from src.config import DATA_DIR, Settings, load_settings
 from src.emergence import baseline as baseline_mod
@@ -331,10 +331,40 @@ def compute_invalidation(
         return None
 
 
+def apply_claims_adjustment(
+    scored: list[dict[str, Any]],
+    digest: dict[str, Any],
+    stage_distribution: dict[str, Any],
+    claims_conviction_floor: float = 0.5,
+) -> list[dict[str, Any]]:
+    """Down-weight each candidate's total_score by how well its
+    machine-checkable `claims` (#18) verify against the digest.
+
+    For every candidate: cv = phases.verify_claims(...) is stored as
+    candidate["claims_verified"], and total_score is scaled by
+    `factor = claims_conviction_floor + (1 - claims_conviction_floor) *
+    cv["fraction"]` (stored as candidate["claims_factor"]). A candidate with
+    no claims at all is neutral (fraction 1.0 -> factor 1.0, unchanged); one
+    whose claims don't hold up against the digest gets scaled down towards
+    `claims_conviction_floor`, never zeroed out. Re-sorts `scored` by the
+    adjusted total_score, descending. Mutates and returns `scored`.
+    """
+    for candidate in scored:
+        cv = phases.verify_claims(candidate, digest, stage_distribution)
+        candidate["claims_verified"] = cv
+        factor = claims_conviction_floor + (1 - claims_conviction_floor) * cv["fraction"]
+        candidate["claims_factor"] = round(factor, 3)
+        candidate["total_score"] = round(candidate.get("total_score", 0.0) * factor, 1)
+    scored.sort(key=lambda c: c["total_score"], reverse=True)
+    return scored
+
+
 def build_result(
     settings: Settings,
     digest: dict[str, Any],
     llm_result: dict[str, Any],
+    stage_distribution: dict[str, Any],
+    next_stage: int | None,
     top_pick: dict[str, Any] | None,
     top5: list[dict[str, Any]],
     track_record: dict[str, Any],
@@ -344,9 +374,15 @@ def build_result(
 ) -> dict[str, Any]:
     return {
         "stages_config": settings.stages,
-        "current_stage": llm_result.get("current_stage"),
-        "next_stage": llm_result.get("next_stage"),
+        # Code wins (#5): current_stage/next_stage are the deterministic
+        # stage-model's picks, not the LLM's. The LLM's own picks + reasoning
+        # are carried separately below as a human-readable cross-check.
+        "current_stage": stage_distribution.get("current_stage"),
+        "next_stage": next_stage,
         "stage_reasoning": llm_result.get("reasoning", ""),
+        "stage_distribution": stage_distribution,
+        "llm_current_stage": llm_result.get("current_stage"),
+        "llm_next_stage": llm_result.get("next_stage"),
         "top_pick": top_pick,
         "top5": top5,
         "track_record": track_record,
@@ -416,6 +452,20 @@ def run(dry_run: bool = False) -> int:
         }
         for t in emergence_result.get("emergent_themes", [])[:3]
     ]
+
+    # 2b. Probabilistic phase model (#5): compute the code's own stage
+    # distribution BEFORE the LLM call, so the LLM can anchor its candidates
+    # on it, and so scoring below uses the deterministic next_stage instead
+    # of blindly trusting the LLM's guess. Only a compact subset is injected
+    # into the digest (the full dict, including activity/momentum, is kept
+    # in the local `stage_distribution` var for scoring/claims/email use).
+    stage_distribution = phases.compute_stage_distribution(digest, settings.stages)
+    digest["stage_distribution"] = {
+        "probabilities": stage_distribution["probabilities"],
+        "current_stage": stage_distribution["current_stage"],
+        "next_stage": stage_distribution["next_stage"],
+        "confidence": stage_distribution["confidence"],
+    }
 
     write_json(LAST_DIGEST_PATH, digest)
     logger.info("Digest written to %s", LAST_DIGEST_PATH)
@@ -491,7 +541,11 @@ def run(dry_run: bool = False) -> int:
         llm_result = llm.analyze(digest, settings.anthropic_api_key)
 
     llm_candidates = llm_result.get("candidates", [])
-    next_stage = llm_result.get("next_stage")
+    # Code wins for scoring (#5/#18): use the deterministic stage-model's
+    # next_stage, not the LLM's own guess. The LLM's current_stage/next_stage
+    # /reasoning are still carried through build_result as a cross-check for
+    # the email ("LLM-Einschätzung").
+    next_stage = stage_distribution["next_stage"]
 
     # Normalize LLM-proposed tickers to uppercase so downstream lookups
     # (watchlist tagging, theme mapping, perf_lookup, option selection) match
@@ -604,6 +658,14 @@ def run(dry_run: bool = False) -> int:
         perf_lookup=perf_lookup,
         all_theme_scores=all_theme_scores,
         reliability=effective_reliability,
+    )
+
+    # 8b. Machine-checkable-claims verification (#18): dampen each
+    # candidate's total_score by how well its claims verify against the
+    # digest, BEFORE the top-pick gate below, so an LLM thesis whose claims
+    # don't hold up loses influence on which candidate actually gets picked.
+    scored = apply_claims_adjustment(
+        scored, digest, stage_distribution, settings.claims_conviction_floor
     )
 
     # 9. Select top candidate (score >= threshold, min_sources satisfied, not in cooldown)
@@ -765,7 +827,11 @@ def run(dry_run: bool = False) -> int:
 
             # Re-score just the top pick with real divergence + option quality
             rescored = scoring.score_candidate(
-                {k: v for k, v in top_pick.items() if k not in ("scores", "total_score", "source_count")},
+                {
+                    k: v
+                    for k, v in top_pick.items()
+                    if k not in ("scores", "total_score", "source_count", "claims_verified", "claims_factor")
+                },
                 digest,
                 next_stage,
                 weights=effective_weights,
@@ -774,6 +840,10 @@ def run(dry_run: bool = False) -> int:
                 all_theme_scores=all_theme_scores,
                 reliability=effective_reliability,
             )
+            # Re-apply the claims dampening (#18) — score_candidate() above
+            # recomputed a fresh total_score that doesn't carry the earlier
+            # claims_factor, so redo it here on the single rescored candidate.
+            apply_claims_adjustment([rescored], digest, stage_distribution, settings.claims_conviction_floor)
             top_pick.update(rescored)
             # Keep list consistent: replace the entry in `scored` too
             for idx, c in enumerate(scored):
@@ -882,7 +952,7 @@ def run(dry_run: bool = False) -> int:
     # src/backtest/calibrate.py). Runs in all modes, including dry-run.
     append_digest_history(
         DIGEST_HISTORY_PATH,
-        current_stage=llm_result.get("current_stage"),
+        current_stage=stage_distribution.get("current_stage"),
         next_stage=next_stage,
         top_pick=top_pick,
         scored_candidates=scored,
@@ -895,6 +965,8 @@ def run(dry_run: bool = False) -> int:
         settings,
         digest,
         llm_result,
+        stage_distribution,
+        next_stage,
         top_pick,
         scored[:5],
         track_record,

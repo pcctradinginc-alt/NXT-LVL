@@ -52,6 +52,69 @@ def _stage_name(stage_id: int | None, stages_config: list[dict[str, Any]]) -> st
     return f"Stufe {stage_id}"
 
 
+def _render_stage_distribution(
+    stage_distribution: dict[str, Any] | None,
+    stages_config: list[dict[str, Any]],
+    stage_reasoning: str,
+    llm_current_stage: int | None,
+    llm_next_stage: int | None,
+) -> str:
+    """Render the probabilistic stage block (#5): top ~4 stages by probability
+    plus a confidence line and a one-line LLM cross-check.
+
+    Returns "" when `stage_distribution` has no probabilities at all, so the
+    caller can fall back to the old single "Aktuell -> Als Nächstes" line for
+    result dicts that don't carry this key (older callers / tests).
+    """
+    if not stage_distribution:
+        return ""
+    probabilities = stage_distribution.get("probabilities") or {}
+    if not probabilities:
+        return ""
+
+    def _prob_value(item: tuple[Any, Any]) -> float:
+        value = item[1]
+        return value if isinstance(value, (int, float)) else 0.0
+
+    top_stages = sorted(probabilities.items(), key=_prob_value, reverse=True)[:4]
+
+    rows = []
+    for stage_id_raw, prob in top_stages:
+        try:
+            stage_id: Any = int(stage_id_raw)
+        except (TypeError, ValueError):
+            stage_id = stage_id_raw
+        name = _stage_name(stage_id, stages_config)
+        pct = prob * 100 if isinstance(prob, (int, float)) else 0.0
+        rows.append(
+            f'<div class="stat-row"><span class="stat-label">{name}</span>'
+            f'<span>{pct:.0f}%</span></div>'
+        )
+
+    confidence = stage_distribution.get("confidence")
+    confidence_str = f"{confidence * 100:.0f}%" if isinstance(confidence, (int, float)) else "n/a"
+    rows.append(
+        f'<div class="stat-row"><span class="stat-label">Konfidenz</span><span>{confidence_str}</span></div>'
+    )
+
+    cross_check = ""
+    if stage_reasoning or llm_current_stage is not None or llm_next_stage is not None:
+        llm_stage_str = (
+            f"{_stage_name(llm_current_stage, stages_config)} &rarr; {_stage_name(llm_next_stage, stages_config)}. "
+            if (llm_current_stage is not None or llm_next_stage is not None)
+            else ""
+        )
+        cross_check = (
+            f'<div class="pick-meta" style="margin-top:8px;">LLM-Einschätzung: {llm_stage_str}{stage_reasoning}</div>'
+        )
+
+    return f"""
+    <div class="thesis">Stufen-Wahrscheinlichkeiten (deterministisch, code-berechnet):</div>
+    {''.join(rows)}
+    {cross_check}
+    """
+
+
 def _render_candidate_table(candidates: list[dict[str, Any]]) -> str:
     rows = []
     for c in candidates[:5]:
@@ -353,11 +416,24 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     top5 = result.get("top5", [])
     track_record = result.get("track_record", {})
 
-    stage_line = (
-        f"Aktuell: {_stage_name(current_stage, stages_config)} &rarr; "
-        f"Als Nächstes: {_stage_name(next_stage, stages_config)}. "
-        f"{stage_reasoning}"
+    # Probabilistic stage block (#5): prefer the code-computed distribution
+    # over the old single "Aktuell -> Als Nächstes" line whenever it's
+    # present; fall back to the old line for result dicts that lack it
+    # (older callers / some existing tests), so those keep working unchanged.
+    stage_block_html = _render_stage_distribution(
+        result.get("stage_distribution"),
+        stages_config,
+        stage_reasoning,
+        result.get("llm_current_stage"),
+        result.get("llm_next_stage"),
     )
+    if stage_block_html:
+        stage_line = stage_block_html
+    else:
+        stage_line = (
+            f'<div class="thesis">Aktuell: {_stage_name(current_stage, stages_config)} &rarr; '
+            f'Als Nächstes: {_stage_name(next_stage, stages_config)}. {stage_reasoning}</div>'
+        )
 
     if top_pick:
         ticker = top_pick.get("ticker", "?")
@@ -389,12 +465,25 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
             else ""
         )
 
+        # Claims-verification line (#18): "Belege geprüft: k/n" — how many of
+        # the candidate's machine-checkable claims actually verified against
+        # the digest. Shown whenever claims_verified is present on the
+        # candidate (main.py sets it for every scored candidate).
+        claims_verified = top_pick.get("claims_verified")
+        claims_line = ""
+        if isinstance(claims_verified, dict):
+            claims_line = (
+                f"<div class=\"pick-meta\">Belege geprüft: "
+                f"{claims_verified.get('verified', 0)}/{claims_verified.get('total', 0)}</div>"
+            )
+
         top_pick_html = f"""
         <div class="card">
           <h2>Top-Pick</h2>
           <div class="pick-ticker">{ticker}<span class="badge">Score {top_pick.get('total_score', 0)}</span></div>
           {option_line}
           {benchmark_line}
+          {claims_line}
           <div class="thesis">{thesis}</div>
         </div>
         """
@@ -443,7 +532,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
   <div class="container">
     <div class="card">
       <h1>NXT LVL &mdash; AI Next-Stage Beneficiary Scanner</h1>
-      <div class="thesis">{stage_line}</div>
+      {stage_line}
     </div>
     {top_pick_html}
     {structure_html}
