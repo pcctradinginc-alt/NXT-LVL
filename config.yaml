@@ -61,6 +61,16 @@ scoring:
   signal_threshold: 60
   min_sources: 2
   cooldown_days: 14
+  # Data-quality gate (#17): suppress the signal outright (instead of
+  # spending a Tradier call + emitting a low-confidence trade) when the
+  # digest's deterministic data-quality score is below this bar.
+  min_data_quality: 45
+  # Signal-clustering gate (#20): require at least this many credible
+  # candidates (total_score >= cluster_score_bar) sharing the top pick's
+  # stage/theme, so a genuinely emergent theme lights up more than one name
+  # rather than a single possibly-noisy outlier.
+  cluster_min_members: 2
+  cluster_score_bar: 45
 
 options:
   dte_min: 90
@@ -82,6 +92,22 @@ options:
 tracking:
   close_after_trading_days: 60
   close_at_dte: 40
+
+# ---------------------------------------------------------------------------
+# Sector benchmarks (#11): map each 7-stage watchlist stage to the ETF a
+# signal from that stage should be measured against (instead of always SPY).
+# `default` is used for candidates with no/unknown stage_id.
+# ---------------------------------------------------------------------------
+
+benchmarks:
+  1: SOXX
+  2: SOXX
+  3: XLU
+  4: SOXX
+  5: IGV
+  6: IGV
+  7: ITA
+  default: SPY
 
 # ---------------------------------------------------------------------------
 # Emergence & Reward Engine (see CONCEPT_EMERGENCE.md)

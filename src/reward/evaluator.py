@@ -257,7 +257,7 @@ def evaluate_signals(
     Returns the updated signals list.
     """
     horizons = reward_cfg.get("horizons", [30, 60, 90, 180])
-    benchmark_symbol = reward_cfg.get("benchmark_symbol", "SPY")
+    default_benchmark_symbol = reward_cfg.get("benchmark_symbol", "SPY")
     today = date.today()
 
     for signal in signals:
@@ -267,6 +267,10 @@ def evaluate_signals(
         age_days = (today - sig_date).days
 
         horizon_evals = signal.setdefault("horizon_evals", {})
+        # Sector benchmarks (#11): measure each signal against ITS OWN stored
+        # benchmark (e.g. SOXX for a semiconductor-stage signal) when present,
+        # falling back to the reward config's global default otherwise.
+        benchmark_symbol = signal.get("benchmark_symbol") or default_benchmark_symbol
 
         for horizon in horizons:
             key = str(horizon)

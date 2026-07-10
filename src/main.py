@@ -263,6 +263,74 @@ def compute_risks(
     return risks
 
 
+def _cluster_member_count(
+    scored: list[dict[str, Any]],
+    stage_id: Any,
+    theme_id: str | None,
+    bar: float,
+) -> int:
+    """Count scored candidates that share `stage_id` or `theme_id` and clear `bar`.
+
+    Pure helper backing the signal-clustering gate (#20): a genuinely
+    emergent theme/stage should surface more than one credible name (total
+    score >= `bar`), not just a single possibly-noisy candidate. Includes the
+    candidate itself when it is present in `scored` (it typically is, since
+    it was picked FROM `scored`).
+    """
+    count = 0
+    for c in scored:
+        if c.get("total_score", 0) < bar:
+            continue
+        same_stage = stage_id is not None and c.get("stage_id") == stage_id
+        c_theme_id = (c.get("discovery") or {}).get("theme_id") or c.get("theme_id")
+        same_theme = theme_id is not None and c_theme_id == theme_id
+        if same_stage or same_theme:
+            count += 1
+    return count
+
+
+def compute_invalidation(
+    tradier: Any,
+    ticker: str,
+    closes: list[float] | None = None,
+) -> dict[str, Any] | None:
+    """Compute invalidation levels (#14) for a persisted signal.
+
+    Primary trigger is a 50-day simple moving average of the underlying:
+    reuses an already-fetched `closes` list (oldest->newest) when available
+    and non-empty, otherwise fetches ~70 daily closes via Tradier. Also
+    carries qualitative invalidation notes (theme-score drop, earnings
+    confirmation). Fault-tolerant: any failure returns None so it never
+    breaks the pipeline.
+    """
+    try:
+        usable = list(closes) if closes else []
+        if not usable:
+            hist_start = (date.today() - timedelta(days=100)).strftime("%Y-%m-%d")
+            history = tradier.get_history(ticker, start=hist_start)
+            usable = [
+                bar.get("close")
+                for bar in history
+                if isinstance(bar, dict) and bar.get("close") is not None
+            ]
+        window = usable[-50:] if usable else []
+        sma50 = sum(window) / len(window) if window else None
+        note = (
+            "These ungültig, wenn Underlying nachhaltig unter 50-Tage-Linie schließt, "
+            "der Theme-Score abfällt, oder der nächste Earnings-Call den AI-Backlog nicht bestätigt."
+        )
+        if window and len(window) < 50:
+            note += f" (Hinweis: nur {len(window)} Handelstage verfügbar für den Durchschnitt.)"
+        return {
+            "below_50dma": round(sma50, 2) if sma50 else None,
+            "theme_score_drop": "Emergence-Score des Themas fällt in 2 Folgeläufen",
+            "note": note,
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("compute_invalidation failed for %s: %s", ticker, exc)
+        return None
+
+
 def build_result(
     settings: Settings,
     digest: dict[str, Any],
@@ -272,6 +340,7 @@ def build_result(
     track_record: dict[str, Any],
     emergent_themes: list[dict[str, Any]] | None = None,
     reward_status: dict[str, Any] | None = None,
+    no_signal_reason: str | None = None,
 ) -> dict[str, Any]:
     return {
         "stages_config": settings.stages,
@@ -283,6 +352,7 @@ def build_result(
         "track_record": track_record,
         "emergent_themes": emergent_themes or [],
         "reward": reward_status,
+        "no_signal_reason": no_signal_reason,
     }
 
 
@@ -554,6 +624,34 @@ def run(dry_run: bool = False) -> int:
         top_pick = candidate
         break
 
+    # 9b. Signal-quality gates (#17 data-quality, #20 clustering) — deliberately
+    # BEFORE any Tradier calls so a low-confidence/single-outlier pick never
+    # wastes an option-chain lookup or gets emitted as a signal.
+    no_signal_reason: str | None = None
+    if top_pick is not None:
+        dq = compute_data_quality(digest)
+        if dq < settings.min_data_quality:
+            no_signal_reason = (
+                f"Datenqualität zu niedrig ({dq}/100, Minimum {settings.min_data_quality}) "
+                "— Signal unterdrückt (mögliche Quellen fehlen/rate-limited)."
+            )
+            logger.info("Data-quality gate fired for %s: %s", top_pick.get("ticker"), no_signal_reason)
+            top_pick = None
+
+    if top_pick is not None:
+        discovery = top_pick.get("discovery") or {}
+        theme_id = discovery.get("theme_id") or top_pick.get("theme_id")
+        cluster_count = _cluster_member_count(
+            scored, top_pick.get("stage_id"), theme_id, settings.cluster_score_bar
+        )
+        if cluster_count < settings.cluster_min_members:
+            no_signal_reason = (
+                "Kein Cluster: nur ein glaubwürdiger Kandidat im Thema/der Stufe — "
+                "mögliches Einzelrauschen statt echtem emergentem Cluster."
+            )
+            logger.info("Cluster gate fired for %s: %s", top_pick.get("ticker"), no_signal_reason)
+            top_pick = None
+
     # 10. Option selection + divergence rescoring for the chosen top pick
     option = None
     three_month_perf = None
@@ -562,6 +660,7 @@ def run(dry_run: bool = False) -> int:
     edate = None
     earnings_trap = False
     earnings_risk_msg = None
+    closes: list[float] = []
     if top_pick is not None:
         ticker = top_pick["ticker"]
         if dry_run or tradier_client is None:
@@ -586,7 +685,9 @@ def run(dry_run: bool = False) -> int:
             # Only meaningful when a long call was actually selected. Every step
             # degrades to None/skip on any failure, so the plain long-call path
             # keeps working exactly as before when nothing special applies.
-            closes: list[float] = []
+            # (`closes` was already initialized to [] above the `if top_pick is
+            # not None:` branch so it's always defined even when this whole
+            # `else:` — dry-run / no Tradier key — is skipped.)
             if option is not None:
                 try:
                     hist_start = (date.today() - timedelta(days=130)).strftime("%Y-%m-%d")
@@ -705,7 +806,10 @@ def run(dry_run: bool = False) -> int:
             entry_mid = option.get("mid") if option else None
             entry_underlying = option.get("underlying_price") if option else None
 
-            benchmark_symbol = reward_cfg.get("benchmark_symbol", "SPY")
+            # Sector benchmarks (#11): measure this signal against the ETF
+            # mapped to its stage (e.g. SOXX for compute/semis) instead of
+            # always SPY.
+            benchmark_symbol = settings.benchmark_for(top_pick.get("stage_id"))
             benchmark_at_signal = None
             if tradier_client is not None:
                 try:
@@ -714,6 +818,13 @@ def run(dry_run: bool = False) -> int:
                         benchmark_at_signal = bench_quote.get("last") or bench_quote.get("close")
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("Benchmark quote lookup failed for %s: %s", benchmark_symbol, exc)
+            top_pick["benchmark_symbol"] = benchmark_symbol
+
+            # Invalidation levels (#14): 50-day moving average + qualitative notes.
+            invalidation = None
+            if tradier_client is not None:
+                invalidation = compute_invalidation(tradier_client, ticker, closes)
+            top_pick["invalidation"] = invalidation
 
             discovery = top_pick.get("discovery") or {}
             source_attribution = list(
@@ -750,6 +861,7 @@ def run(dry_run: bool = False) -> int:
                 discovery=discovery,
                 emergence_at_signal=emergence_at_signal,
                 structure=structure,
+                invalidation=invalidation,
                 realized_vol=rvol,
                 earnings_date=edate,
             )
@@ -788,6 +900,7 @@ def run(dry_run: bool = False) -> int:
         track_record,
         emergent_themes=emergence_result.get("emergent_themes", []),
         reward_status=reward_status,
+        no_signal_reason=no_signal_reason,
     )
     subject, html = build_email(result)
 

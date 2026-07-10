@@ -217,6 +217,37 @@ def _render_discovery(discovery: dict[str, Any] | None) -> str:
     """
 
 
+def _render_invalidation(invalidation: dict[str, Any] | None) -> str:
+    """Render the "These ungültig, wenn:" section (#14), or "" if absent."""
+    if not invalidation:
+        return ""
+    below_50dma = invalidation.get("below_50dma")
+    below_str = (
+        f"Unterhalb {_fmt_num(below_50dma, '', 2)} (50-Tage-Durchschnitt)"
+        if below_50dma is not None
+        else "50-Tage-Durchschnitt nicht verfügbar"
+    )
+    theme_score_drop = invalidation.get("theme_score_drop")
+    note = invalidation.get("note", "")
+
+    rows = [
+        f"<div class=\"stat-row\"><span class=\"stat-label\">Kurs</span><span>{below_str}</span></div>"
+    ]
+    if theme_score_drop:
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">Thema</span><span>{theme_score_drop}</span></div>"
+        )
+    note_html = f"<div class=\"thesis\" style=\"margin-top:8px;\">{note}</div>" if note else ""
+
+    return f"""
+    <div class="card">
+      <h2>These ungültig, wenn:</h2>
+      {''.join(rows)}
+      {note_html}
+    </div>
+    """
+
+
 def _render_risks(risks: list[str] | None) -> str:
     """Render the "Risiken" section, or "" if no risks were flagged/present."""
     if not risks:
@@ -337,6 +368,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
         dte = option.get("dte")
         delta = option.get("delta")
         thesis = top_pick.get("thesis", "")
+        benchmark_symbol = top_pick.get("benchmark_symbol")
 
         if strike is not None and expiration:
             subject = f"NXT LVL Signal: {ticker} {strike}C {expiration}"
@@ -351,22 +383,33 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
                 "&mdash; Signal nur auf Aktienebene.</div>"
             )
 
+        benchmark_line = (
+            f"<div class=\"pick-meta\">Gemessen gegen Sektor-Benchmark: {benchmark_symbol}</div>"
+            if benchmark_symbol
+            else ""
+        )
+
         top_pick_html = f"""
         <div class="card">
           <h2>Top-Pick</h2>
           <div class="pick-ticker">{ticker}<span class="badge">Score {top_pick.get('total_score', 0)}</span></div>
           {option_line}
+          {benchmark_line}
           <div class="thesis">{thesis}</div>
         </div>
         """
     else:
         subject = "NXT LVL: Kein Signal heute"
-        top_pick_html = """
+        no_signal_reason = result.get("no_signal_reason")
+        no_signal_text = no_signal_reason or (
+            "Kein Kandidat hat heute den Signal-Schwellwert (Score &ge; 70, "
+            "mindestens 2 unabhängige Quellen) erreicht oder war im Cooldown. Kein Signal ist ein "
+            "gültiges Ergebnis &mdash; Qualität vor Quantität."
+        )
+        top_pick_html = f"""
         <div class="card">
           <h2>Top-Pick</h2>
-          <p class="no-signal">Kein Kandidat hat heute den Signal-Schwellwert (Score &ge; 70,
-          mindestens 2 unabhängige Quellen) erreicht oder war im Cooldown. Kein Signal ist ein
-          gültiges Ergebnis &mdash; Qualität vor Quantität.</p>
+          <p class="no-signal">{no_signal_text}</p>
         </div>
         """
 
@@ -389,6 +432,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
         else ""
     )
     risks_html = _render_risks((top_pick or {}).get("risks")) if top_pick else ""
+    invalidation_html = _render_invalidation((top_pick or {}).get("invalidation")) if top_pick else ""
     emergent_themes_html = _render_emergent_themes(result.get("emergent_themes"))
     reward_html = _render_reward_status(result.get("reward"))
 
@@ -403,6 +447,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     </div>
     {top_pick_html}
     {structure_html}
+    {invalidation_html}
     {discovery_html}
     {risks_html}
     {top5_html}

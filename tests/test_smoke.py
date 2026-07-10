@@ -21,6 +21,7 @@ from src.emergence import detector as emergence_detector
 from src.mailer import build_email
 from src.options.tradier import TradierClient
 from src import tracking
+from src.main import _cluster_member_count, compute_data_quality
 from src.reward import engine as reward_engine
 from src.reward import evaluator as reward_evaluator
 from src.reward import weights as weights_mod
@@ -1229,3 +1230,160 @@ def test_select_short_leg():
     ]
     client2 = SelectableTradierClient(expirations=[exp], chain=illiquid, quote={"last": 115.0})
     assert client2.select_short_leg("VRT", exp, target_delta=0.32) is None
+
+
+# ---------------------------------------------------------------------------
+# Decision gates & reporting (#11 sector benchmarks, #14 invalidation levels,
+# #17 data-quality gate, #20 signal clustering)
+# ---------------------------------------------------------------------------
+
+def test_benchmark_for_maps_stage():
+    from src.config import Settings, load_settings
+
+    settings = load_settings()
+    assert settings.benchmark_for(5) == "IGV"
+    assert settings.benchmark_for(3) == "XLU"
+    assert settings.benchmark_for(99) == "SPY"  # unmapped stage -> configured default
+
+    # Handles str-keyed benchmark dicts (and str stage_id queries) too, not
+    # just YAML's int-keyed parsing.
+    str_keyed = Settings(raw={"benchmarks": {"5": "IGV", "3": "XLU", "default": "SPY"}})
+    assert str_keyed.benchmark_for(5) == "IGV"
+    assert str_keyed.benchmark_for("3") == "XLU"
+    assert str_keyed.benchmark_for(None) == "SPY"
+
+
+class RecordingHistoryTradier(FakeHistoryTradier):
+    """FakeHistoryTradier that records which symbols get_history() was called with."""
+
+    def __init__(self, history_by_symbol: dict[str, list[dict]]):
+        super().__init__(history_by_symbol)
+        self.requested_symbols: list[str] = []
+
+    def get_history(self, symbol: str, start: str, interval: str = "daily"):
+        self.requested_symbols.append(symbol)
+        return super().get_history(symbol, start, interval)
+
+
+def test_evaluator_uses_signal_benchmark():
+    from datetime import date, timedelta
+
+    signal_date = (date.today() - timedelta(days=100)).isoformat()
+    underlying_prices = [100.0 + i * 0.3 for i in range(110)]
+    soxx_prices = [50.0 + i * 0.1 for i in range(110)]
+
+    signal = {
+        "id": "sig_bench",
+        "date": signal_date,
+        "ticker": "MRVL",
+        "score": 80.0,
+        "thesis": "test",
+        "status": "open",
+        "checkpoints": [],
+        "result": None,
+        "benchmark_symbol": "SOXX",  # per-signal sector benchmark, not the global default
+        "horizon_evals": {},
+    }
+    # Note: "SPY" is deliberately absent from history_by_symbol — if the
+    # evaluator fell back to the reward_cfg global default instead of the
+    # signal's own benchmark_symbol, this would fetch SPY (empty history)
+    # instead of SOXX and the horizon would never evaluate.
+    fake = RecordingHistoryTradier(
+        {
+            "MRVL": _daily_bars(signal_date, underlying_prices),
+            "SOXX": _daily_bars(signal_date, soxx_prices),
+        }
+    )
+    reward_cfg = {"horizons": [90], "benchmark_symbol": "SPY"}
+    updated = reward_evaluator.evaluate_signals(
+        [signal], fake, reward_cfg, current_emergence_scores=None,
+        path="/tmp/does_not_matter_signals_bench.json",
+    )
+    assert "SOXX" in fake.requested_symbols
+    assert "SPY" not in fake.requested_symbols
+    assert "90" in updated[0]["horizon_evals"]
+
+
+def test_data_quality_gate_blocks():
+    from src.config import load_settings
+
+    settings = load_settings()
+    sparse_digest = {
+        "edgar_capex": {"source": "edgar_capex", "companies": {}, "aggregate_capex_yoy_pct": None},
+        "github_trends": {"source": "github_trends", "top_new_repos": [], "stage_heat": {}},
+        "jobs_hn": {"source": "jobs_hn", "stage_job_counts": {}, "stage_job_mom_change": {}, "total_comments": 0},
+        "arxiv_trends": {"source": "arxiv_trends", "stage_paper_counts": {}, "sample_hot_titles": []},
+        "hn_buzz": {"source": "hn_buzz", "stage_buzz": {}},
+        "edgar_fts": {"source": "edgar_fts", "theme_counts": {}},
+    }
+    dq = compute_data_quality(sparse_digest)
+    assert dq < settings.min_data_quality
+
+
+def test_cluster_gate_helper():
+    scored = [
+        {"ticker": "AAA", "stage_id": 3, "total_score": 80.0},
+        {"ticker": "BBB", "stage_id": 5, "total_score": 70.0},
+    ]
+    # Only AAA shares stage_id=3 and clears the bar -> 1 member, below the
+    # default min of 2 -> the clustering gate would fire.
+    count = _cluster_member_count(scored, stage_id=3, theme_id=None, bar=45.0)
+    assert count == 1
+
+    scored_with_cluster = scored + [{"ticker": "CCC", "stage_id": 3, "total_score": 50.0}]
+    count2 = _cluster_member_count(scored_with_cluster, stage_id=3, theme_id=None, bar=45.0)
+    assert count2 == 2
+
+    # A candidate below the score bar does not count toward the cluster.
+    scored_weak = scored + [{"ticker": "DDD", "stage_id": 3, "total_score": 10.0}]
+    count3 = _cluster_member_count(scored_weak, stage_id=3, theme_id=None, bar=45.0)
+    assert count3 == 1
+
+    # theme_id match also counts, independent of stage_id.
+    themed = [
+        {"ticker": "AAA", "stage_id": 3, "total_score": 80.0, "discovery": {"theme_id": "dc_cooling"}},
+        {"ticker": "EEE", "stage_id": 7, "total_score": 60.0, "theme_id": "dc_cooling"},
+    ]
+    count4 = _cluster_member_count(themed, stage_id=3, theme_id="dc_cooling", bar=45.0)
+    assert count4 == 2
+
+
+def test_mailer_renders_no_signal_reason():
+    result = {
+        "stages_config": [],
+        "current_stage": None,
+        "next_stage": None,
+        "stage_reasoning": "",
+        "top_pick": None,
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+        "no_signal_reason": "Datenqualität zu niedrig (30.0/100, Minimum 45) — Signal unterdrückt.",
+    }
+    subject, html = build_email(result)
+    assert "Datenqualität zu niedrig" in html
+
+
+def test_mailer_renders_invalidation():
+    result = {
+        "stages_config": [{"id": 3, "name": "Energie / Kühlung / Netz"}],
+        "current_stage": 2,
+        "next_stage": 3,
+        "stage_reasoning": "Test reasoning",
+        "top_pick": {
+            "ticker": "VRT",
+            "total_score": 82.5,
+            "thesis": "Cooling demand thesis",
+            "option": {"strike": 120, "expiration": "2026-11-20", "mid": 5.25, "dte": 136, "delta": 0.65},
+            "benchmark_symbol": "XLU",
+            "invalidation": {
+                "below_50dma": 105.5,
+                "theme_score_drop": "Emergence-Score des Themas fällt in 2 Folgeläufen",
+                "note": "These ungültig, wenn Underlying nachhaltig unter 50-Tage-Linie schließt.",
+            },
+        },
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+    }
+    subject, html = build_email(result)
+    assert "ungültig" in html
+    assert "XLU" in html

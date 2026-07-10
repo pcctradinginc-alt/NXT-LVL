@@ -66,6 +66,21 @@ class Settings:
         return int(self.scoring.get("cooldown_days", 14))
 
     @property
+    def min_data_quality(self) -> float:
+        """Data-quality gate (#17): minimum compute_data_quality() score to emit a signal."""
+        return float(self.scoring.get("min_data_quality", 45))
+
+    @property
+    def cluster_min_members(self) -> int:
+        """Signal-clustering gate (#20): minimum credible candidates sharing the theme/stage."""
+        return int(self.scoring.get("cluster_min_members", 2))
+
+    @property
+    def cluster_score_bar(self) -> float:
+        """Signal-clustering gate (#20): total_score bar a candidate must clear to count as a member."""
+        return float(self.scoring.get("cluster_score_bar", 45))
+
+    @property
     def options_config(self) -> dict[str, Any]:
         return self.raw.get("options", {})
 
@@ -92,6 +107,35 @@ class Settings:
     @property
     def reward_config(self) -> dict[str, Any]:
         return self.raw.get("reward", {})
+
+    @property
+    def benchmarks(self) -> dict[Any, str]:
+        """Sector benchmarks (#11): {stage_id: etf_symbol}, plus a "default" key."""
+        return self.raw.get("benchmarks", {})
+
+    def benchmark_for(self, stage_id: int | str | None) -> str:
+        """Return the sector benchmark ETF for `stage_id`, or the configured default.
+
+        Handles both int and str stage keys (YAML parses unquoted numeric
+        keys as int, but callers may pass either), falling back to "SPY" if
+        no `benchmarks` block or `default` key is configured at all.
+        """
+        benchmarks = self.benchmarks
+        default = benchmarks.get("default", "SPY")
+        if stage_id is None:
+            return default
+        if stage_id in benchmarks:
+            return benchmarks[stage_id]
+        try:
+            stage_id_int = int(stage_id)
+        except (TypeError, ValueError):
+            stage_id_int = None
+        if stage_id_int is not None and stage_id_int in benchmarks:
+            return benchmarks[stage_id_int]
+        stage_id_str = str(stage_id)
+        if stage_id_str in benchmarks:
+            return benchmarks[stage_id_str]
+        return default
 
     def stage_by_id(self, stage_id: int) -> dict[str, Any] | None:
         for stage in self.stages:

@@ -110,6 +110,7 @@ def add_signal(
     structure: dict[str, Any] | None = None,
     realized_vol: float | None = None,
     earnings_date: str | None = None,
+    invalidation: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create and persist a new open signal. Returns the created signal dict.
 
@@ -151,6 +152,8 @@ def add_signal(
         "structure": structure,
         "realized_vol": realized_vol,
         "earnings_date": earnings_date,
+        # --- Invalidation levels (#14) ---
+        "invalidation": invalidation,
     }
     signals.append(signal)
     save_signals(signals, path)
