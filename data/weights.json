@@ -136,5 +136,10 @@
         "n": 0.0
       }
     }
-  ]
+  ],
+  "ledger": {
+    "features": {},
+    "sources": {}
+  },
+  "rewarded_evals": []
 }

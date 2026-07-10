@@ -1,1 +1,43 @@
-[]
+[
+  {
+    "id": "7c82ff928403",
+    "date": "2026-07-10",
+    "ticker": "JNPR",
+    "occ_symbol": null,
+    "strike": null,
+    "expiration": null,
+    "entry_option_mid": null,
+    "entry_underlying": null,
+    "score": 66.5,
+    "thesis": "Juniper Networks is positioned to capture routing and switching demand for AI inference clusters and edge deployment; optical networking themes dominate SEC filings (12 mentions) and the shift from training to inference workloads requires high-throughput, low-latency interconnects.",
+    "status": "open",
+    "checkpoints": [],
+    "result": null,
+    "data_sources": [
+      "arxiv_trends"
+    ],
+    "reasoning": "Juniper Networks is positioned to capture routing and switching demand for AI inference clusters and edge deployment; optical networking themes dominate SEC filings (12 mentions) and the shift from training to inference workloads requires high-throughput, low-latency interconnects.",
+    "recommended_horizon_days": 90,
+    "price_at_signal": null,
+    "benchmark_symbol": "SPY",
+    "benchmark_at_signal": 751.71,
+    "option_idea": null,
+    "data_quality_score": 93.4,
+    "source_attribution": [
+      "arxiv_trends"
+    ],
+    "feature_attribution": {
+      "breadth": 20.0,
+      "momentum": 12.1,
+      "stage_fit": 15.0,
+      "divergence": 7.5,
+      "option_quality": 5.0,
+      "emergence": 10.0
+    },
+    "discovery": {
+      "via": "llm"
+    },
+    "emergence_at_signal": null,
+    "horizon_evals": {}
+  }
+]
