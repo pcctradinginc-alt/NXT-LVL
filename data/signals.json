@@ -11,7 +11,13 @@
     "score": 66.5,
     "thesis": "Juniper Networks is positioned to capture routing and switching demand for AI inference clusters and edge deployment; optical networking themes dominate SEC filings (12 mentions) and the shift from training to inference workloads requires high-throughput, low-latency interconnects.",
     "status": "open",
-    "checkpoints": [],
+    "checkpoints": [
+      {
+        "date": "2026-07-11",
+        "option_mid": null,
+        "dte": null
+      }
+    ],
     "result": null,
     "data_sources": [
       "arxiv_trends"
