@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-haiku-4-5"
-MAX_TOKENS = 2048
+# 8192, not 2048: the per-candidate `claims` arrays (#18) make the JSON reply
+# several KB, and at 2048 the response was truncated mid-string -> JSON parse
+# failure -> empty fallback -> no signal. Haiku only bills actual output tokens,
+# so the headroom is effectively free.
+MAX_TOKENS = 8192
 
 REQUIRED_TOP_LEVEL_FIELDS = ["current_stage", "next_stage", "candidates"]
 REQUIRED_CANDIDATE_FIELDS = ["ticker", "stage_id", "thesis", "source_evidence", "conviction"]
