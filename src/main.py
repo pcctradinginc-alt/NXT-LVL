@@ -236,6 +236,26 @@ def compute_data_quality(digest: dict[str, Any]) -> float:
     return round((source_completeness + capex_ok + comment_volume_score) / 3, 1)
 
 
+def _ticker_tradeable(tradier: Any, ticker: str) -> bool:
+    """True if `ticker` resolves to a real Tradier quote with a positive price.
+
+    Filters out LLM-hallucinated company names / invalid symbols (e.g.
+    "MOBILEYE" instead of "MBLY") before they become a useless, non-tradeable
+    stock-only signal that would also pollute the track record.
+    """
+    try:
+        quote = tradier.get_quote(ticker)
+    except Exception:  # noqa: BLE001
+        return False
+    if not quote:
+        return False
+    price = quote.get("last") or quote.get("close")
+    try:
+        return price is not None and float(price) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def compute_risks(
     top_pick: dict[str, Any] | None,
     option: dict[str, Any] | None,
@@ -705,6 +725,12 @@ def run(dry_run: bool = False) -> int:
             continue
         if tracking.in_cooldown(ticker, settings.cooldown_days, signals=signals_list):
             logger.info("Candidate %s is in cooldown, skipping", ticker)
+            continue
+        if not dry_run and tradier_client is not None and not _ticker_tradeable(tradier_client, ticker):
+            # The LLM occasionally emits a company name or wrong symbol (e.g.
+            # "MOBILEYE" instead of "MBLY"); such a ticker resolves to no
+            # Tradier quote and must not become a phantom signal.
+            logger.info("Candidate %s is not a resolvable/tradeable symbol, skipping", ticker)
             continue
         top_pick = candidate
         break
