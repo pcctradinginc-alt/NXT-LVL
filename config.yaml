@@ -211,6 +211,43 @@ emergence:
     forms: "10-K,10-Q,8-K"
     lookback_days: 90
 
+# ---------------------------------------------------------------------------
+# SEC-filing language acceleration (#8): rate-of-change of AI-buildout phrases
+# in the hyperscalers' latest 10-Q/10-K vs. their prior one. Defaults to the
+# same company set as capex_companies (see src/collectors/edgar_language.py).
+# ---------------------------------------------------------------------------
+
+edgar_language:
+  enabled: true
+  companies:
+    - MSFT
+    - GOOGL
+    - AMZN
+    - META
+    - ORCL
+    - NVDA
+  # Multi-word phrases preferred (single generic words like "cloud"/"power"
+  # produce XBRL-taxonomy substring noise). Includes the real filing spellings
+  # verified against live 10-Qs (e.g. hyperscalers write "datacenter" one word,
+  # and "remaining performance obligations" rather than "backlog").
+  phrases:
+    - "artificial intelligence"
+    - "ai demand"
+    - "backlog"
+    - "remaining performance obligations"
+    - "capacity constrained"
+    - "capacity constraints"
+    - "lead times"
+    - "liquid cooling"
+    - "grid interconnect"
+    - "custom silicon"
+    - "data center"
+    - "datacenter"
+    - "capital expenditures"
+    - "power constraints"
+    - "power availability"
+    - "customer concentration"
+
 reward:
   benchmark_symbol: "SPY"
   horizons: [30, 60, 90, 180]

@@ -23,8 +23,9 @@ from pathlib import Path
 from typing import Any
 
 from src import tracking
+from src.analysis import insider as insider_mod
 from src.analysis import llm, phases, scoring, structures
-from src.collectors import arxiv_trends, edgar_capex, edgar_fts, github_trends, hn_buzz, jobs_hn
+from src.collectors import arxiv_trends, edgar_capex, edgar_fts, edgar_language, github_trends, hn_buzz, jobs_hn
 from src.config import DATA_DIR, Settings, load_settings
 from src.emergence import baseline as baseline_mod
 from src.emergence import detector as emergence_detector
@@ -46,6 +47,12 @@ LAST_EMAIL_PATH = DATA_DIR / "last_email.html"
 BASELINE_PATH = DATA_DIR / "baseline.json"
 WEIGHTS_PATH = DATA_DIR / "weights.json"
 DIGEST_HISTORY_PATH = DATA_DIR / "digest_history.jsonl"
+
+# Deceleration filter, free parts (#10): a top_pick with at least this many
+# Form 4 filings in the lookback window is flagged as "heavy insider
+# activity" even when the best-effort net-sell direction couldn't be
+# determined (recent_form4 count alone is a weaker but still useful proxy).
+INSIDER_FORM4_HIGH_THRESHOLD = 5
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -113,6 +120,20 @@ def run_collectors(settings: Settings) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("edgar_fts collector crashed unexpectedly: %s", exc)
         digest["edgar_fts"] = {"source": "edgar_fts", "theme_counts": {}}
+
+    logger.info("Running collector: edgar_language")
+    try:
+        lang_cfg = settings.edgar_language_config
+        if lang_cfg.get("enabled", True):
+            lang_companies = lang_cfg.get("companies") or settings.capex_companies
+            lang_phrases = lang_cfg.get("phrases") or edgar_language.DEFAULT_PHRASES
+            digest["edgar_language"] = edgar_language.collect(lang_companies, lang_phrases)
+        else:
+            logger.info("edgar_language collector disabled via config")
+            digest["edgar_language"] = {"source": "edgar_language", "companies": {}, "aggregate": {}}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("edgar_language collector crashed unexpectedly: %s", exc)
+        digest["edgar_language"] = {"source": "edgar_language", "companies": {}, "aggregate": {}}
 
     return digest
 
@@ -371,6 +392,7 @@ def build_result(
     emergent_themes: list[dict[str, Any]] | None = None,
     reward_status: dict[str, Any] | None = None,
     no_signal_reason: str | None = None,
+    edgar_language: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "stages_config": settings.stages,
@@ -389,6 +411,7 @@ def build_result(
         "emergent_themes": emergent_themes or [],
         "reward": reward_status,
         "no_signal_reason": no_signal_reason,
+        "edgar_language": edgar_language,
     }
 
 
@@ -890,6 +913,48 @@ def run(dry_run: bool = False) -> int:
                     logger.warning("Benchmark quote lookup failed for %s: %s", benchmark_symbol, exc)
             top_pick["benchmark_symbol"] = benchmark_symbol
 
+            # Deceleration filter, free parts (#10): insider selling (Form 4)
+            # and relative-strength roll-over — computed only for this single
+            # top_pick, bounded to a handful of extra requests. Everything is
+            # wrapped so any failure just skips the flags/risk strings.
+            insider_signal = None
+            try:
+                if tradier_client is not None:
+                    ticker_to_cik = edgar_capex.build_ticker_to_cik_map()
+                    insider_signal = insider_mod.insider_selling_signal(
+                        ticker, lambda t, _map=ticker_to_cik: _map.get(t)
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("insider_selling_signal failed for %s: %s", ticker, exc)
+                insider_signal = None
+
+            rs_signal = None
+            try:
+                if tradier_client is not None and closes:
+                    bench_hist_start = (date.today() - timedelta(days=130)).strftime("%Y-%m-%d")
+                    bench_history = tradier_client.get_history(benchmark_symbol, start=bench_hist_start)
+                    benchmark_closes = [
+                        bar.get("close")
+                        for bar in bench_history
+                        if isinstance(bar, dict) and bar.get("close") is not None
+                    ]
+                    rs_signal = insider_mod.relative_strength_decel(closes, benchmark_closes)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("relative_strength_decel failed for %s: %s", ticker, exc)
+                rs_signal = None
+
+            if insider_signal and (
+                insider_signal.get("net_sell_hint") == "sell"
+                or (insider_signal.get("recent_form4") or 0) >= INSIDER_FORM4_HIGH_THRESHOLD
+            ):
+                risks.append("Auffällige Insider-Verkäufe (Form 4) in den letzten ~90 Tagen.")
+            if rs_signal and rs_signal.get("decelerating"):
+                risks.append(
+                    "Relative Stärke dreht nach unten (kurzfristige RS < mittelfristige) — "
+                    "mögliche Erschöpfung trotz guter Nachrichten."
+                )
+            top_pick["risks"] = risks
+
             # Invalidation levels (#14): 50-day moving average + qualitative notes.
             invalidation = None
             if tradier_client is not None:
@@ -934,6 +999,8 @@ def run(dry_run: bool = False) -> int:
                 invalidation=invalidation,
                 realized_vol=rvol,
                 earnings_date=edate,
+                insider=insider_signal,
+                rs=rs_signal,
             )
 
     # 12. Track record stats
@@ -973,6 +1040,7 @@ def run(dry_run: bool = False) -> int:
         emergent_themes=emergence_result.get("emergent_themes", []),
         reward_status=reward_status,
         no_signal_reason=no_signal_reason,
+        edgar_language=digest.get("edgar_language"),
     )
     subject, html = build_email(result)
 

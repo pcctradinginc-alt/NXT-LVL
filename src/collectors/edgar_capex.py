@@ -60,8 +60,21 @@ def _parse_date(value: str) -> date | None:
         return None
 
 
+# Shared CIK resolver cache: company_tickers.json is a several-hundred-KB
+# payload that never changes within a single process run, and multiple
+# modules (edgar_capex, edgar_language, insider) all need the ticker->CIK
+# map. Caching it here (module-level, in-process only) lets every caller
+# reuse a single fetch per run instead of re-downloading it per collector.
+# Only successful (non-empty) results are cached, so a transient failure on
+# one call doesn't poison later calls in the same run.
+_CIK_MAP_CACHE: dict[str, int] = {}
+
+
 def build_ticker_to_cik_map() -> dict[str, int]:
-    """Fetch the SEC ticker->CIK map once. Returns {} on failure."""
+    """Fetch the SEC ticker->CIK map once per process (cached). Returns {} on failure."""
+    if _CIK_MAP_CACHE:
+        return _CIK_MAP_CACHE
+
     try:
         raw = get_json(TICKERS_URL)
     except Exception as exc:  # noqa: BLE001
@@ -78,6 +91,9 @@ def build_ticker_to_cik_map() -> dict[str, int]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("edgar_capex: malformed company_tickers.json: %s", exc)
         return {}
+
+    if mapping:
+        _CIK_MAP_CACHE.update(mapping)
     return mapping
 
 

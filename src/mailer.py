@@ -353,6 +353,32 @@ def _render_emergent_themes(emergent_themes: list[dict[str, Any]] | None) -> str
     """
 
 
+def _render_filing_language(edgar_language: dict[str, Any] | None) -> str:
+    """Render the compact "Filing-Sprache (Beschleunigung)" block (#8), or "" if absent.
+
+    Shows the top ~4 phrases by positive aggregate delta (latest filing vs.
+    prior filing, summed across companies) — i.e. which AI-buildout phrases
+    are accelerating the most right now. Skipped entirely when there's no
+    accelerating phrase to show.
+    """
+    if not edgar_language:
+        return ""
+    aggregate = edgar_language.get("aggregate") or {}
+    positive = [
+        (phrase, delta) for phrase, delta in aggregate.items() if isinstance(delta, (int, float)) and delta > 0
+    ]
+    if not positive:
+        return ""
+    positive.sort(key=lambda item: item[1], reverse=True)
+    items = "".join(f"<li>&bdquo;{phrase}&ldquo; {delta:+.0f} ggü. Vorquartal</li>" for phrase, delta in positive[:4])
+    return f"""
+    <div class="card">
+      <h2>Filing-Sprache (Beschleunigung)</h2>
+      <ul>{items}</ul>
+    </div>
+    """
+
+
 def _render_reward_status(reward: dict[str, Any] | None) -> str:
     """Render the reward-engine status section, or "" if not present."""
     if not reward:
@@ -523,6 +549,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     risks_html = _render_risks((top_pick or {}).get("risks")) if top_pick else ""
     invalidation_html = _render_invalidation((top_pick or {}).get("invalidation")) if top_pick else ""
     emergent_themes_html = _render_emergent_themes(result.get("emergent_themes"))
+    filing_language_html = _render_filing_language(result.get("edgar_language"))
     reward_html = _render_reward_status(result.get("reward"))
 
     html = f"""<!DOCTYPE html>
@@ -541,6 +568,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     {risks_html}
     {top5_html}
     {emergent_themes_html}
+    {filing_language_html}
     <div class="card">
       <h2>Track Record</h2>
       {_render_track_record(track_record)}

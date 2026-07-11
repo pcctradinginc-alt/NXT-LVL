@@ -111,6 +111,8 @@ def add_signal(
     realized_vol: float | None = None,
     earnings_date: str | None = None,
     invalidation: dict[str, Any] | None = None,
+    insider: dict[str, Any] | None = None,
+    rs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create and persist a new open signal. Returns the created signal dict.
 
@@ -154,6 +156,9 @@ def add_signal(
         "earnings_date": earnings_date,
         # --- Invalidation levels (#14) ---
         "invalidation": invalidation,
+        # --- Deceleration filter, free parts (#10) ---
+        "insider": insider,
+        "rs": rs,
     }
     signals.append(signal)
     save_signals(signals, path)

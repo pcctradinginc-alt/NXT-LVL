@@ -115,6 +115,11 @@ class Settings:
         return self.raw.get("emergence", {})
 
     @property
+    def edgar_language_config(self) -> dict[str, Any]:
+        """SEC-filing language-acceleration collector config (#8)."""
+        return self.raw.get("edgar_language", {})
+
+    @property
     def reward_config(self) -> dict[str, Any]:
         return self.raw.get("reward", {})
 

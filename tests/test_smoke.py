@@ -15,7 +15,8 @@ import pytest
 
 os.environ.setdefault("NXT_OFFLINE", "1")
 
-from src.analysis import llm, options_math, phases, scoring, structures
+from src.analysis import insider, llm, options_math, phases, scoring, structures
+from src.collectors import edgar_language
 from src.emergence import baseline as baseline_mod
 from src.emergence import detector as emergence_detector
 from src.mailer import build_email
@@ -1550,3 +1551,154 @@ def test_config_claims_conviction_floor_default():
 
     settings = load_settings()
     assert settings.claims_conviction_floor == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# SEC-filing language acceleration (#8) & deceleration filter free parts (#10)
+# ---------------------------------------------------------------------------
+
+def test_edgar_language_offline():
+    # NXT_OFFLINE=1 is set at module import time (see top of file) -> must
+    # short-circuit before any network call and return the empty structure.
+    result = edgar_language.collect(["MSFT"], ["backlog"])
+    assert result == {"source": "edgar_language", "companies": {}, "aggregate": {}}
+
+
+def test_edgar_language_phrase_delta():
+    latest_text = "we see strong backlog and ai demand growing. backlog backlog"
+    prior_text = "backlog was modest last quarter"
+    deltas = edgar_language._phrase_deltas(latest_text, prior_text, ["backlog", "ai demand", "liquid cooling"])
+
+    assert deltas["backlog"] == {"latest": 3, "prior": 1, "delta": 2}
+    assert deltas["ai demand"] == {"latest": 1, "prior": 0, "delta": 1}
+    assert deltas["liquid cooling"] == {"latest": 0, "prior": 0, "delta": 0}
+
+
+def test_edgar_language_html_to_text_strips_tags_and_entities():
+    raw = "<html><body><p>Backlog &amp; capacity constrained</p></body></html>"
+    text = edgar_language._html_to_text(raw)
+    assert "<" not in text
+    assert "backlog & capacity constrained" in text
+
+
+def test_config_edgar_language_defaults():
+    from src.config import load_settings
+
+    settings = load_settings()
+    cfg = settings.edgar_language_config
+    assert cfg.get("enabled") is True
+    assert "MSFT" in cfg.get("companies", [])
+    assert "backlog" in cfg.get("phrases", [])
+
+
+def test_relative_strength_decel():
+    # Case 1: strong prior climb, then the last 21 days go flat -> short-window
+    # RS rolls over below the long-window RS -> decelerating True.
+    decel_underlying = [100 + i * (100 / 42) for i in range(43)] + [200.0] * 21
+    flat_benchmark = [50.0] * 64
+
+    result = insider.relative_strength_decel(decel_underlying, flat_benchmark)
+    assert result is not None
+    assert result["rs_21"] < result["rs_63"]
+    assert result["decelerating"] is True
+
+    # Case 2: weak drift over the full quarter, but the last 21 days accelerate
+    # hard -> short-window RS clears the long-window RS -> decelerating False.
+    accel_underlying = [250 - i * (100 / 42) for i in range(43)] + [150 + i * (150 / 21) for i in range(1, 22)]
+
+    result2 = insider.relative_strength_decel(accel_underlying, flat_benchmark)
+    assert result2 is not None
+    assert result2["rs_21"] > result2["rs_63"]
+    assert result2["decelerating"] is False
+
+    # Case 3: too little history for the long window -> None.
+    assert insider.relative_strength_decel([100.0, 101.0, 102.0], [50.0, 51.0, 52.0]) is None
+    assert insider.relative_strength_decel(None, [50.0] * 64) is None
+    assert insider.relative_strength_decel([100.0] * 64, []) is None
+
+
+def test_insider_signal_shape(monkeypatch):
+    from datetime import date
+
+    # This test exercises the (mocked) network path, so temporarily lift the
+    # module-wide NXT_OFFLINE=1 short-circuit for just this test.
+    monkeypatch.delenv("NXT_OFFLINE", raising=False)
+
+    fake_submissions = {
+        "filings": {
+            "recent": {
+                "form": ["4", "10-Q", "4"],
+                "accessionNumber": ["0001-24-000111", "0001-24-000112", "0001-24-000113"],
+                "primaryDocument": ["form4_a.xml", "10q.htm", "form4_b.xml"],
+                "filingDate": [date.today().isoformat()] * 3,
+            }
+        }
+    }
+    fake_sell_xml = (
+        "<nonDerivativeTransaction><transactionCode>S</transactionCode>"
+        "<transactionShares><value>1,000</value></transactionShares></nonDerivativeTransaction>"
+    )
+
+    monkeypatch.setattr(insider, "get_json", lambda url, **kw: fake_submissions)
+    monkeypatch.setattr(insider, "get_text", lambda url, **kw: fake_sell_xml)
+
+    result = insider.insider_selling_signal("XYZ", lambda t: 12345)
+    assert result == {"recent_form4": 2, "net_sell_hint": "sell"}
+
+    # No CIK resolvable -> None (fault-tolerant, not a hard error).
+    assert insider.insider_selling_signal("XYZ", lambda t: None) is None
+
+    # cik_resolver raising -> None, never propagates.
+    def _raising_resolver(_ticker):
+        raise RuntimeError("boom")
+
+    assert insider.insider_selling_signal("XYZ", _raising_resolver) is None
+
+
+def test_insider_signal_offline_short_circuits(monkeypatch):
+    # NXT_OFFLINE=1 is already set process-wide for this test module; make sure
+    # insider_selling_signal never even calls the resolver.
+    calls = []
+
+    def _resolver(t):
+        calls.append(t)
+        return 1
+
+    assert insider.insider_selling_signal("XYZ", _resolver) is None
+    assert calls == []
+
+
+def test_mailer_renders_filing_language():
+    result = {
+        "stages_config": [],
+        "current_stage": None,
+        "next_stage": None,
+        "stage_reasoning": "",
+        "top_pick": None,
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+        "edgar_language": {
+            "source": "edgar_language",
+            "companies": {},
+            "aggregate": {"liquid cooling": 12, "backlog": 5, "ai demand": -2},
+        },
+    }
+    subject, html = build_email(result)
+    assert "liquid cooling" in html
+    assert "Vorquartal" in html
+    assert "backlog" in html
+
+
+def test_mailer_skips_filing_language_when_no_positive_delta():
+    result = {
+        "stages_config": [],
+        "current_stage": None,
+        "next_stage": None,
+        "stage_reasoning": "",
+        "top_pick": None,
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+        "edgar_language": {"source": "edgar_language", "companies": {}, "aggregate": {"backlog": 0, "ai demand": -1}},
+    }
+    subject, html = build_email(result)
+    assert "Filing-Sprache" not in html
