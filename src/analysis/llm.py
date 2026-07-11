@@ -31,6 +31,12 @@ DEFAULT_MODEL = "claude-haiku-4-5"
 # so the headroom is effectively free.
 MAX_TOKENS = 8192
 
+# A generation of several KB takes longer than the 15s HTTP default used for
+# the free collectors; a non-streaming LLM call must wait for the whole
+# response, so it gets its own generous read timeout (else it fails with a
+# read-timeout -> empty fallback -> no signal).
+LLM_TIMEOUT = 90
+
 REQUIRED_TOP_LEVEL_FIELDS = ["current_stage", "next_stage", "candidates"]
 REQUIRED_CANDIDATE_FIELDS = ["ticker", "stage_id", "thesis", "source_evidence", "conviction"]
 
@@ -157,7 +163,7 @@ def _call_anthropic(api_key: str, system: str, user_text: str, model: str) -> st
         "system": system,
         "messages": [{"role": "user", "content": user_text}],
     }
-    response = request_json("POST", ANTHROPIC_URL, headers=headers, json_body=body)
+    response = request_json("POST", ANTHROPIC_URL, headers=headers, json_body=body, timeout=LLM_TIMEOUT)
     data = response.json()
 
     if data.get("stop_reason") == "refusal":
