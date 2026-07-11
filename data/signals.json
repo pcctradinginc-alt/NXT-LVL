@@ -21,6 +21,11 @@
         "date": "2026-07-11",
         "option_mid": null,
         "dte": null
+      },
+      {
+        "date": "2026-07-11",
+        "option_mid": null,
+        "dte": null
       }
     ],
     "result": null,
@@ -50,5 +55,60 @@
     },
     "emergence_at_signal": null,
     "horizon_evals": {}
+  },
+  {
+    "id": "37da61b783ac",
+    "date": "2026-07-11",
+    "ticker": "MOBILEYE",
+    "occ_symbol": null,
+    "strike": null,
+    "expiration": null,
+    "entry_option_mid": null,
+    "entry_underlying": null,
+    "score": 63.7,
+    "thesis": "Intel's autonomous driving subsidiary (now majority-owned) develops edge AI for vehicle perception and decision-making; Stage 7 emergence aligns with inference-at-edge and real-time robotics control requirements.",
+    "status": "open",
+    "checkpoints": [],
+    "result": null,
+    "data_sources": [
+      "jobs_hn",
+      "github_trends",
+      "arxiv_trends"
+    ],
+    "reasoning": "Intel's autonomous driving subsidiary (now majority-owned) develops edge AI for vehicle perception and decision-making; Stage 7 emergence aligns with inference-at-edge and real-time robotics control requirements.",
+    "recommended_horizon_days": 90,
+    "price_at_signal": null,
+    "benchmark_symbol": "ITA",
+    "benchmark_at_signal": 239.06,
+    "option_idea": null,
+    "data_quality_score": 93.5,
+    "source_attribution": [
+      "jobs_hn",
+      "github_trends",
+      "arxiv_trends"
+    ],
+    "feature_attribution": {
+      "breadth": 20.0,
+      "momentum": 9.96,
+      "stage_fit": 15.0,
+      "divergence": 7.5,
+      "option_quality": 5.0,
+      "emergence": 10.0
+    },
+    "discovery": {
+      "via": "llm"
+    },
+    "emergence_at_signal": null,
+    "horizon_evals": {},
+    "structure": null,
+    "realized_vol": null,
+    "earnings_date": null,
+    "invalidation": {
+      "below_50dma": null,
+      "theme_score_drop": "Emergence-Score des Themas fällt in 2 Folgeläufen",
+      "note": "These ungültig, wenn Underlying nachhaltig unter 50-Tage-Linie schließt, der Theme-Score abfällt, oder der nächste Earnings-Call den AI-Backlog nicht bestätigt."
+    },
+    "insider": null,
+    "rs": null
   }
 ]
