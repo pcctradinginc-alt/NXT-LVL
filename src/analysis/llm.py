@@ -67,7 +67,10 @@ Your job:
 1. State the CURRENT and NEXT stage, informed by (and normally matching) `stage_distribution`.
 2. Propose 5-10 candidate tickers for the identified next stage(s). Explicitly avoid the current \
 mega-cap winners (e.g. NVDA, MSFT, GOOGL, AMZN, META) — focus on names that are not yet fully \
-priced in, preferring liquid mid-caps with tradable options relevant to the next stage.
+priced in, preferring liquid mid-caps with tradable options relevant to the next stage. Every \
+candidate MUST be a valid, currently US-exchange-listed (NYSE/Nasdaq) ticker SYMBOL — e.g. "MBLY", \
+not "Mobileye" — never a company name, and never a private company with no public ticker (e.g. \
+Anduril, Figure, Boston Dynamics).
 3. For each candidate, provide: ticker, stage_id (int, the stage this candidate belongs to), a \
 1-2 sentence thesis, source_evidence (list of source names from \
 ["edgar_capex","github_trends","jobs_hn","arxiv_trends","hn_buzz"] that support this candidate \

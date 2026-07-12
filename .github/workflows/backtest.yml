@@ -1,0 +1,64 @@
+name: Walk-forward Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start date YYYY-MM-DD (optional; blank = CLI default, 3 years before --end)"
+        required: false
+        type: string
+        default: ""
+      end:
+        description: "End date YYYY-MM-DD (optional; blank = CLI default, today minus the longest horizon)"
+        required: false
+        type: string
+        default: ""
+      cadence:
+        description: "Days between as-of samples (optional; blank = CLI default, 30)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run walk-forward backtest against live Tradier history
+        env:
+          TRADIER_API_KEY: ${{ secrets.TRADIER_API_KEY }}
+          TRADIER_ENV: ${{ vars.TRADIER_ENV }}
+        run: |
+          ARGS=()
+          if [ -n "${{ inputs.start }}" ]; then
+            ARGS+=(--start "${{ inputs.start }}")
+          fi
+          if [ -n "${{ inputs.end }}" ]; then
+            ARGS+=(--end "${{ inputs.end }}")
+          fi
+          if [ -n "${{ inputs.cadence }}" ]; then
+            ARGS+=(--cadence "${{ inputs.cadence }}")
+          fi
+          python -m src.backtest.walkforward "${ARGS[@]}"
+
+      - name: Upload walk-forward report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: walkforward-report
+          path: data/walkforward_report.json
+          if-no-files-found: warn

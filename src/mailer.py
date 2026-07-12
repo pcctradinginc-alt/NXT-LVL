@@ -159,7 +159,11 @@ def _fmt_num(value: Any, suffix: str = "", decimals: int = 2) -> str:
     return "-"
 
 
-def _render_structure(structure: dict[str, Any] | None, earnings_trap: bool = False) -> str:
+def _render_structure(
+    structure: dict[str, Any] | None,
+    earnings_trap: bool = False,
+    iv_percentile: float | None = None,
+) -> str:
     """Render the recommended options structure block (German), or "" if absent."""
     if not structure:
         return ""
@@ -208,6 +212,15 @@ def _render_structure(structure: dict[str, Any] | None, earnings_trap: bool = Fa
         rows.append(
             f"<div class=\"stat-row\"><span class=\"stat-label\">IV teuer?</span>"
             f"<span>{iv_expensive_label}{iv_detail}</span></div>"
+        )
+
+    # IV-rank forward (#6): the option's IV vs. this ticker's OWN accumulated
+    # history, once enough prior observations exist.
+    if isinstance(iv_percentile, (int, float)):
+        n_hint = ""
+        rows.append(
+            f"<div class=\"stat-row\"><span class=\"stat-label\">IV-Perzentil (eigene Historie)</span>"
+            f"<span>{_fmt_num(iv_percentile, '%', 0)}{n_hint}</span></div>"
         )
 
     theta_per_day = metrics.get("theta_per_day")
@@ -542,7 +555,11 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     # result dicts (without these keys) render exactly as before.
     discovery_html = _render_discovery((top_pick or {}).get("discovery")) if top_pick else ""
     structure_html = (
-        _render_structure((top_pick or {}).get("structure"), bool((top_pick or {}).get("earnings_trap")))
+        _render_structure(
+            (top_pick or {}).get("structure"),
+            bool((top_pick or {}).get("earnings_trap")),
+            (top_pick or {}).get("iv_percentile"),
+        )
         if top_pick
         else ""
     )

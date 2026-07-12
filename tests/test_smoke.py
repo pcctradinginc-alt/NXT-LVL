@@ -15,14 +15,14 @@ import pytest
 
 os.environ.setdefault("NXT_OFFLINE", "1")
 
-from src.analysis import insider, llm, options_math, phases, scoring, structures
+from src.analysis import earnings, insider, iv_rank, llm, options_math, phases, scoring, structures
 from src.collectors import edgar_language
 from src.emergence import baseline as baseline_mod
 from src.emergence import detector as emergence_detector
 from src.mailer import build_email
 from src.options.tradier import TradierClient
 from src import tracking
-from src.main import _cluster_member_count, apply_claims_adjustment, compute_data_quality
+from src.main import _cluster_member_count, _drop_megacaps, apply_claims_adjustment, compute_data_quality
 from src.reward import engine as reward_engine
 from src.reward import evaluator as reward_evaluator
 from src.reward import weights as weights_mod
@@ -1702,3 +1702,188 @@ def test_mailer_skips_filing_language_when_no_positive_delta():
     }
     subject, html = build_email(result)
     assert "Filing-Sprache" not in html
+
+
+# ---------------------------------------------------------------------------
+# Mega-cap exclusion gate (#1), ticker resolution (#3), free earnings
+# calendar fallback (#4)
+# ---------------------------------------------------------------------------
+
+def test_megacap_llm_candidates_dropped():
+    candidates = [
+        {"ticker": "TSLA", "thesis": "current mega-cap winner"},
+        {"ticker": "VRT", "thesis": "not a mega-cap"},
+        {"ticker": "tsla", "thesis": "lower-case mega-cap must still be dropped"},
+        {"thesis": "no ticker at all"},
+    ]
+    kept = _drop_megacaps(candidates, ["NVDA", "MSFT", "GOOGL", "GOOG", "AMZN", "META", "AAPL", "TSLA"])
+    kept_tickers = [c.get("ticker") for c in kept]
+    assert "VRT" in kept_tickers
+    assert "TSLA" not in kept_tickers
+    assert "tsla" not in kept_tickers
+    assert len(kept) == 2  # VRT + the ticker-less candidate
+
+
+class FakeSearchTradierClient(TradierClient):
+    """TradierClient subclass returning a canned `_get` response for search tests."""
+
+    def __init__(self, response):
+        super().__init__(api_key="fake", env="prod")
+        self._response = response
+
+    def _get(self, path: str, params=None):
+        return self._response
+
+
+def test_search_symbol_parses():
+    # Exact match must win even when listed second (list shape).
+    response_list = {
+        "securities": {
+            "security": [
+                {"symbol": "MBLYW", "exchange": "Q", "type": "stock", "description": "Mobileye Warrant"},
+                {"symbol": "MBLY", "exchange": "Q", "type": "stock", "description": "Mobileye Global Inc"},
+            ]
+        }
+    }
+    client = FakeSearchTradierClient(response_list)
+    assert client.search_symbol("MBLY") == "MBLY"
+
+    # Company-name query with a single equity result (dict shape, lower-case symbol).
+    response_dict = {
+        "securities": {
+            "security": {"symbol": "mbly", "exchange": "Q", "type": "stock", "description": "Mobileye Global Inc"}
+        }
+    }
+    client2 = FakeSearchTradierClient(response_dict)
+    assert client2.search_symbol("MOBILEYE") == "MBLY"
+
+    # Empty/garbage responses -> None, never raises.
+    assert FakeSearchTradierClient({}).search_symbol("NOTHING") is None
+    assert FakeSearchTradierClient({"securities": None}).search_symbol("NOTHING") is None
+    assert FakeSearchTradierClient({"securities": {"security": None}}).search_symbol("NOTHING") is None
+    assert FakeSearchTradierClient({"securities": {"security": []}}).search_symbol("NOTHING") is None
+    assert FakeSearchTradierClient(None).search_symbol("NOTHING") is None
+
+    # Empty query -> None without even reaching _get.
+    assert FakeSearchTradierClient(None).search_symbol("") is None
+
+
+def test_earnings_next_date_parses(monkeypatch):
+    from datetime import date, datetime, timedelta, timezone
+
+    future_date = date.today() + timedelta(days=30)
+    future_ts = int(datetime(future_date.year, future_date.month, future_date.day, tzinfo=timezone.utc).timestamp())
+    good_payload = {
+        "quoteSummary": {
+            "result": [
+                {
+                    "calendarEvents": {
+                        "earnings": {"earningsDate": [{"raw": future_ts, "fmt": future_date.isoformat()}]}
+                    }
+                }
+            ]
+        }
+    }
+    monkeypatch.setattr(earnings, "get_json", lambda url, **kw: good_payload)
+    assert earnings.next_earnings_date("VRT") == future_date.isoformat()
+
+    # Past-only earnings date -> None (no upcoming event).
+    past_date = date.today() - timedelta(days=30)
+    past_ts = int(datetime(past_date.year, past_date.month, past_date.day, tzinfo=timezone.utc).timestamp())
+    past_payload = {
+        "quoteSummary": {"result": [{"calendarEvents": {"earnings": {"earningsDate": [{"raw": past_ts}]}}}]}
+    }
+    monkeypatch.setattr(earnings, "get_json", lambda url, **kw: past_payload)
+    assert earnings.next_earnings_date("VRT") is None
+
+    # 401 / any exception -> None, fault-tolerant, never propagates.
+    def _raise_401(url, **kw):
+        raise Exception("401 Client Error: Unauthorized")
+
+    monkeypatch.setattr(earnings, "get_json", _raise_401)
+    assert earnings.next_earnings_date("VRT") is None
+
+    # Unexpected/empty shape -> None.
+    monkeypatch.setattr(earnings, "get_json", lambda url, **kw: {"quoteSummary": {"result": []}})
+    assert earnings.next_earnings_date("VRT") is None
+
+
+# ---------------------------------------------------------------------------
+# #5 filing-language hardening: word-boundary counting + MD&A extraction
+# ---------------------------------------------------------------------------
+
+def test_phrase_deltas_word_boundary():
+    # "cloud" must NOT be credited inside a longer XBRL-taxonomy token, but a
+    # standalone "cloud" is; multi-word phrases still match.
+    latest = "intelligentcloudsegmentmember revenue. the cloud grew. liquid cooling ramped."
+    prior = "the cloud was flat."
+    deltas = edgar_language._phrase_deltas(latest, prior, ["cloud", "liquid cooling"])
+    assert deltas["cloud"]["latest"] == 1  # only the standalone "cloud"
+    assert deltas["cloud"]["prior"] == 1
+    assert deltas["cloud"]["delta"] == 0
+    assert deltas["liquid cooling"]["latest"] == 1
+    assert deltas["liquid cooling"]["delta"] == 1
+
+
+def test_extract_mdna():
+    text = (
+        "cover page. management's discussion and analysis backlog is accelerating "
+        "quantitative and qualitative disclosures about market risk boilerplate here"
+    )
+    section = edgar_language._extract_mdna(text)
+    assert "backlog is accelerating" in section
+    assert "boilerplate here" not in section
+    # No markers -> full text is returned unchanged.
+    plain = "just some filing text with no headings"
+    assert edgar_language._extract_mdna(plain) == plain
+
+
+# ---------------------------------------------------------------------------
+# #6 IV-rank forward
+# ---------------------------------------------------------------------------
+
+def test_iv_percentile():
+    history = [{"ticker": "VRT", "iv": v} for v in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]]
+    # Above most -> high percentile.
+    assert iv_rank.iv_percentile("VRT", 0.95, history, min_samples=8) >= 80
+    # Below most -> low percentile.
+    assert iv_rank.iv_percentile("VRT", 0.35, history, min_samples=8) <= 20
+    # Fewer than min_samples for this ticker -> None.
+    assert iv_rank.iv_percentile("VRT", 0.5, history, min_samples=20) is None
+    assert iv_rank.iv_percentile("OTHER", 0.5, history, min_samples=8) is None
+    # None current_iv -> None.
+    assert iv_rank.iv_percentile("VRT", None, history, min_samples=8) is None
+
+
+def test_append_and_load_iv_history(tmp_path):
+    p = tmp_path / "iv_history.jsonl"
+    iv_rank.append_iv(p, "VRT", 0.55)
+    iv_rank.append_iv(p, "MOD", 0.42)
+    iv_rank.append_iv(p, "VRT", None)  # skipped
+    iv_rank.append_iv(p, "VRT", 0)  # skipped (non-positive)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write("not json\n")  # malformed line, must be tolerated
+    loaded = iv_rank.load_iv_history(p)
+    assert len(loaded) == 2
+    assert {r["ticker"] for r in loaded} == {"VRT", "MOD"}
+
+
+def test_mailer_renders_iv_percentile():
+    result = {
+        "stages_config": [{"id": 3, "name": "Energie / Kühlung / Netz"}],
+        "current_stage": 2,
+        "next_stage": 3,
+        "stage_reasoning": "x",
+        "top_pick": {
+            "ticker": "VRT",
+            "total_score": 82.5,
+            "thesis": "t",
+            "option": {"strike": 120, "expiration": "2026-11-20", "mid": 5.25, "dte": 136, "delta": 0.65},
+            "structure": {"structure": "long_call", "reason": "ok", "iv_expensive": False, "metrics": {"break_even": 125.25}},
+            "iv_percentile": 87.0,
+        },
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+    }
+    _subject, html = build_email(result)
+    assert "Perzentil" in html

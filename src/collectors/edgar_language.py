@@ -60,6 +60,18 @@ DEFAULT_PHRASES = [
 _TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# MD&A section markers (#5 hardening): narrative language ("backlog is
+# accelerating", "capacity constrained", ...) concentrates in the
+# Management's Discussion & Analysis section. Slicing down to it before
+# counting avoids picking up unrelated boilerplate/XBRL-taxonomy text
+# elsewhere in the document. Both are lowercase literals since callers pass
+# already-lowercased text (see _html_to_text).
+_MDNA_START_MARKER = "management's discussion and analysis"
+_MDNA_END_MARKERS = (
+    "quantitative and qualitative disclosures about market risk",
+    "controls and procedures",
+)
+
 
 def _html_to_text(raw_html: str) -> str:
     """Crude HTML->text: strip tags, unescape entities, lowercase, collapse whitespace.
@@ -75,6 +87,36 @@ def _html_to_text(raw_html: str) -> str:
     return text.strip()
 
 
+def _extract_mdna(text: str) -> str:
+    """Slice `text` down to the Management's Discussion & Analysis section.
+
+    Finds the first occurrence of `_MDNA_START_MARKER`, then the nearest
+    subsequent occurrence of any `_MDNA_END_MARKERS` entry, and returns the
+    text in between. Falls back to the FULL `text` when either the start
+    marker is absent, or no end marker follows it — a filing whose headings
+    don't match this boilerplate should still get counted (just without the
+    section focus), not silently lose all its data.
+
+    Pure and side-effect-free so it's trivially unit-testable. Expects
+    already-lowercased text (as produced by `_html_to_text`).
+    """
+    start_idx = text.find(_MDNA_START_MARKER)
+    if start_idx == -1:
+        return text
+
+    search_from = start_idx + len(_MDNA_START_MARKER)
+    end_idx = -1
+    for marker in _MDNA_END_MARKERS:
+        idx = text.find(marker, search_from)
+        if idx != -1 and (end_idx == -1 or idx < end_idx):
+            end_idx = idx
+
+    if end_idx == -1:
+        return text
+
+    return text[start_idx:end_idx]
+
+
 def _phrase_deltas(
     latest_text: str, prior_text: str, phrases: list[str]
 ) -> dict[str, dict[str, int]]:
@@ -82,13 +124,19 @@ def _phrase_deltas(
 
     Returns {phrase: {"latest": n, "prior": n, "delta": n}}. Case-insensitive
     (callers are expected to pass already-lowercased text, but phrases are
-    lowercased here too for safety).
+    lowercased here too for safety). Counts use word-boundary regex matching
+    (`\\bphrase\\b`) rather than naive substring counting, so a phrase like
+    "cloud" doesn't get credited for appearing inside an unrelated longer
+    token such as "intelligentcloudsegmentmember" (XBRL-taxonomy noise).
+    Multi-word phrases still match literally (internal spaces are treated as
+    plain characters), just anchored so they can't match inside a longer word.
     """
     result: dict[str, dict[str, int]] = {}
     for phrase in phrases:
         needle = phrase.lower()
-        latest_count = latest_text.count(needle)
-        prior_count = prior_text.count(needle)
+        pattern = re.compile(r"\b" + re.escape(needle) + r"\b")
+        latest_count = len(pattern.findall(latest_text))
+        prior_count = len(pattern.findall(prior_text))
         result[phrase] = {
             "latest": latest_count,
             "prior": prior_count,
@@ -221,7 +269,11 @@ def collect(
             requests_made += 1
             time.sleep(REQUEST_PAUSE_SECONDS)
 
-            deltas = _phrase_deltas(latest_text, prior_text, phrases)
+            # #5: focus on the MD&A narrative before counting (falls back to
+            # the full text when the section markers aren't found).
+            deltas = _phrase_deltas(
+                _extract_mdna(latest_text), _extract_mdna(prior_text), phrases
+            )
             result["companies"][ticker.upper()] = deltas
             for phrase, d in deltas.items():
                 aggregate[phrase] = aggregate.get(phrase, 0) + d["delta"]

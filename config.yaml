@@ -93,6 +93,9 @@ options:
   max_iv_realized_ratio: 1.6
   spread_short_delta: 0.32
   earnings_trap_dte_fraction: 0.34
+  # IV-rank (#6): minimum prior IV observations for THIS ticker before an
+  # IV percentile (option's IV vs. its own accumulated history) is reported.
+  iv_history_min_samples: 8
 
 tracking:
   close_after_trading_days: 60

@@ -23,7 +23,9 @@ from pathlib import Path
 from typing import Any
 
 from src import tracking
+from src.analysis import earnings
 from src.analysis import insider as insider_mod
+from src.analysis import iv_rank
 from src.analysis import llm, phases, scoring, structures
 from src.collectors import arxiv_trends, edgar_capex, edgar_fts, edgar_language, github_trends, hn_buzz, jobs_hn
 from src.config import DATA_DIR, Settings, load_settings
@@ -47,6 +49,7 @@ LAST_EMAIL_PATH = DATA_DIR / "last_email.html"
 BASELINE_PATH = DATA_DIR / "baseline.json"
 WEIGHTS_PATH = DATA_DIR / "weights.json"
 DIGEST_HISTORY_PATH = DATA_DIR / "digest_history.jsonl"
+IV_HISTORY_PATH = DATA_DIR / "iv_history.jsonl"
 
 # Deceleration filter, free parts (#10): a top_pick with at least this many
 # Form 4 filings in the lookback window is flagged as "heavy insider
@@ -254,6 +257,30 @@ def _ticker_tradeable(tradier: Any, ticker: str) -> bool:
         return price is not None and float(price) > 0
     except (TypeError, ValueError):
         return False
+
+
+def _drop_megacaps(candidates: list[dict[str, Any]], exclude: list[str]) -> list[dict[str, Any]]:
+    """Filter out any candidate whose ticker is on the mega-cap exclusion list.
+
+    Pure helper backing the mega-cap exclusion gate (#1): the emergence path
+    already filters mega-caps via entities.detect_entities(megacap_exclude=...),
+    but the LLM proposes candidates independently and, despite the system
+    prompt's explicit instruction to avoid current mega-cap winners, has been
+    observed to still pick one (e.g. TSLA, which is on this list) — a direct
+    contradiction of the "next-stage beneficiaries, NOT current winners"
+    mission. This makes the exclusion unconditional in code, regardless of
+    what the LLM does. Comparison is case-insensitive; candidates without a
+    ticker are kept as-is (nothing to compare).
+    """
+    exclude_upper = {str(t).upper() for t in (exclude or [])}
+    kept: list[dict[str, Any]] = []
+    for cand in candidates:
+        ticker = cand.get("ticker")
+        if ticker and str(ticker).upper() in exclude_upper:
+            logger.info("Dropping mega-cap LLM candidate %s (on megacap_exclude list)", ticker)
+            continue
+        kept.append(cand)
+    return kept
 
 
 def compute_risks(
@@ -597,6 +624,11 @@ def run(dry_run: bool = False) -> int:
         if cand.get("ticker"):
             cand["ticker"] = str(cand["ticker"]).strip().upper()
 
+    # Mega-cap exclusion gate (#1): enforce settings.megacap_exclude on the
+    # LLM's own candidates in code, not just via the system prompt — see
+    # _drop_megacaps() docstring for why this is necessary.
+    llm_candidates = _drop_megacaps(llm_candidates, settings.megacap_exclude)
+
     # Tag LLM candidates with discovery metadata (watchlist vs. llm-proposed).
     for cand in llm_candidates:
         cand.setdefault(
@@ -729,9 +761,28 @@ def run(dry_run: bool = False) -> int:
         if not dry_run and tradier_client is not None and not _ticker_tradeable(tradier_client, ticker):
             # The LLM occasionally emits a company name or wrong symbol (e.g.
             # "MOBILEYE" instead of "MBLY"); such a ticker resolves to no
-            # Tradier quote and must not become a phantom signal.
-            logger.info("Candidate %s is not a resolvable/tradeable symbol, skipping", ticker)
-            continue
+            # Tradier quote. Rather than discard a potentially good idea
+            # outright (#3), attempt to resolve it to a real tradeable ticker
+            # via Tradier's symbol search — bounded to one search per
+            # considered candidate.
+            resolved: str | None = None
+            try:
+                resolved = tradier_client.search_symbol(ticker)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("search_symbol failed for %s: %s", ticker, exc)
+                resolved = None
+            resolved_ok = (
+                bool(resolved)
+                and resolved.upper() not in {str(t).upper() for t in settings.megacap_exclude}
+                and _ticker_tradeable(tradier_client, resolved)
+            )
+            if resolved_ok:
+                logger.info("Resolved candidate ticker %s -> %s via Tradier symbol search", ticker, resolved)
+                candidate["ticker"] = resolved
+                ticker = resolved
+            else:
+                logger.info("Candidate %s is not a resolvable/tradeable symbol, skipping", ticker)
+                continue
         top_pick = candidate
         break
 
@@ -841,7 +892,12 @@ def run(dry_run: bool = False) -> int:
                 # note and flags a German risk string when an earnings event
                 # falls inside the option's early life (theta/IV-crush trap).
                 try:
-                    edate = tradier_client.get_next_earnings_date(ticker)
+                    # Tradier's fundamentals calendar is unavailable on many
+                    # accounts (returns None); fall back to the free, keyless
+                    # Yahoo Finance quoteSummary endpoint (#4) so this gate
+                    # actually has a chance to fire instead of staying
+                    # permanently dormant.
+                    edate = tradier_client.get_next_earnings_date(ticker) or earnings.next_earnings_date(ticker)
                     if edate and option.get("dte"):
                         earnings_dt = datetime.strptime(edate, "%Y-%m-%d").date()
                         days_to_earnings = (earnings_dt - date.today()).days
@@ -987,6 +1043,28 @@ def run(dry_run: bool = False) -> int:
                 invalidation = compute_invalidation(tradier_client, ticker, closes)
             top_pick["invalidation"] = invalidation
 
+            # IV-rank forward (#6): rank this option's IV against this ticker's
+            # OWN accumulated history (Tradier exposes no IV history, so we grow
+            # it ourselves). Rank against PRIOR observations, then record the
+            # current one so it counts next time.
+            iv_pct = None
+            option_iv = option.get("iv") if option else None
+            if option_iv:
+                iv_pct = iv_rank.iv_percentile(
+                    ticker,
+                    option_iv,
+                    iv_rank.load_iv_history(IV_HISTORY_PATH),
+                    settings.iv_history_min_samples,
+                )
+                iv_rank.append_iv(IV_HISTORY_PATH, ticker, option_iv)
+                if iv_pct is not None and iv_pct >= 80:
+                    risks.append(
+                        f"Options-IV im oberen Bereich der eigenen Historie (Perzentil {iv_pct:.0f}) "
+                        "— Option historisch teuer, Zeitwert-/Crush-Risiko erhöht."
+                    )
+                    top_pick["risks"] = risks
+            top_pick["iv_percentile"] = iv_pct
+
             discovery = top_pick.get("discovery") or {}
             source_attribution = list(
                 set(top_pick.get("source_evidence", [])) & set(scoring.ALL_SOURCES)
@@ -1027,6 +1105,7 @@ def run(dry_run: bool = False) -> int:
                 earnings_date=edate,
                 insider=insider_signal,
                 rs=rs_signal,
+                iv_percentile=iv_pct,
             )
 
     # 12. Track record stats

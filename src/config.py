@@ -81,6 +81,11 @@ class Settings:
         return float(self.scoring.get("cluster_score_bar", 45))
 
     @property
+    def iv_history_min_samples(self) -> int:
+        """IV-rank (#6): min prior IV observations per ticker before a percentile is reported."""
+        return int(self.options_config.get("iv_history_min_samples", 8))
+
+    @property
     def claims_conviction_floor(self) -> float:
         """Machine-checkable-claims gate (#18): floor of the total_score dampening
 

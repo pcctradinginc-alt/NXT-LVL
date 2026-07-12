@@ -1035,6 +1035,60 @@ def _print_report(report: dict[str, Any]) -> None:
         print(f"  - {note}")
 
 
+def _fmt_ic(v: Any) -> str:
+    return f"{v:+.3f}" if isinstance(v, (int, float)) else "n/a"
+
+
+def _print_summary(report: dict[str, Any]) -> None:
+    """Print a compact, clearly-delimited, grep-friendly summary block.
+
+    Purely additive to `_print_report` (same report dict, no new computation):
+    intended to make CI/Actions logs easy to scan without wading through the
+    full tabular report above. Defensive against missing/partial keys (e.g. a
+    horizon or source with too few samples) — always prints "n/a" rather than
+    raising.
+    """
+    print("=== WALK-FORWARD SUMMARY ===")
+    print(f"samples: {report.get('n_samples', 'n/a')}")
+
+    ic90 = (report.get("ic_by_component") or {}).get("90") or {}
+    ic_parts = ", ".join(
+        f"{comp}={_fmt_ic(ic90.get(comp))}" for comp in ("divergence", "theme_momentum", "breadth", "total")
+    )
+    print(f"IC (Spearman) by component @90d: {ic_parts}")
+
+    buckets90 = (report.get("buckets") or {}).get("90") or {}
+    hit_parts = []
+    for label in ("Q4", "Q3", "Q2", "Q1"):
+        b = buckets90.get(label) or {}
+        hr = b.get("hit_rate")
+        hit_parts.append(f"{label}={hr:.1%}" if isinstance(hr, (int, float)) else f"{label}=n/a")
+    print(f"hit-rate by top-score quartile @90d: {', '.join(hit_parts)}")
+
+    lead_lag = report.get("lead_lag") or {}
+    ll_parts = []
+    for source, info in lead_lag.items():
+        info = info or {}
+        sh = info.get("strongest_horizon_days")
+        si = info.get("strongest_ic")
+        if sh is not None and isinstance(si, (int, float)):
+            ll_parts.append(f"{source}@{sh}d(IC={si:+.3f})")
+        else:
+            ll_parts.append(f"{source}=n/a")
+    print(f"lead-lag (best horizon per source): {', '.join(ll_parts) if ll_parts else 'n/a'}")
+
+    to = report.get("temporal_ordering") or {}
+    pct = to.get("pct_leading_before_price_move")
+    if isinstance(pct, (int, float)):
+        print(f"temporal-ordering: {pct:.1f}%")
+    else:
+        print("temporal-ordering: n/a")
+
+    notes = report.get("notes") or []
+    print(f"notes: {' | '.join(notes) if notes else 'n/a'}")
+    print("=== END SUMMARY ===")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="NXT LVL — walk-forward out-of-sample backtest (point-in-time digest reconstruction)"
@@ -1103,6 +1157,7 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     _print_report(report)
+    _print_summary(report)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(REPORT_PATH, "w", encoding="utf-8") as fh:

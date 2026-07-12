@@ -113,6 +113,7 @@ def add_signal(
     invalidation: dict[str, Any] | None = None,
     insider: dict[str, Any] | None = None,
     rs: dict[str, Any] | None = None,
+    iv_percentile: float | None = None,
 ) -> dict[str, Any]:
     """Create and persist a new open signal. Returns the created signal dict.
 
@@ -159,6 +160,8 @@ def add_signal(
         # --- Deceleration filter, free parts (#10) ---
         "insider": insider,
         "rs": rs,
+        # --- IV-rank forward (#6) ---
+        "iv_percentile": iv_percentile,
     }
     signals.append(signal)
     save_signals(signals, path)

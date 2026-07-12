@@ -331,6 +331,73 @@ class TradierClient:
         )
         return best
 
+    def search_symbol(self, query: str) -> str | None:
+        """Resolve a company name or non-standard symbol to a tradable ticker.
+
+        Calls Tradier's `/v1/markets/search` endpoint (equities only, indexes
+        excluded) and returns the best match's uppercase symbol, or None if
+        no usable result is found. This backs the ticker-resolution fallback
+        (#3): the LLM sometimes emits a company NAME (e.g. "MOBILEYE") or a
+        non-symbol instead of the real ticker (e.g. "MBLY") — such a
+        candidate would otherwise just be discarded. Best match is chosen by
+        preferring an exact (case-insensitive) symbol match to the query,
+        then a startswith match either direction, then falling back to
+        result order; ties are broken by preferring a NYSE/NASDAQ listing.
+        Fully fault-tolerant: any error, empty response, or unrecognized
+        response shape returns None rather than raising.
+        """
+        if not query or not str(query).strip():
+            return None
+        query = str(query).strip()
+
+        data = self._get("/v1/markets/search", params={"q": query, "indexes": "false"})
+        if not data:
+            return None
+        try:
+            securities = data.get("securities")
+        except AttributeError:
+            return None
+        if not securities:
+            return None
+        try:
+            security = securities.get("security")
+        except AttributeError:
+            return None
+        if security is None:
+            return None
+
+        if isinstance(security, dict):
+            results: list[dict[str, Any]] = [security]
+        elif isinstance(security, list):
+            results = [r for r in security if isinstance(r, dict)]
+        else:
+            return None
+        if not results:
+            return None
+
+        # Soft preference only — Tradier's exchange codes vary by account/API
+        # version, so this never excludes a result, just orders it later.
+        preferred_exchanges = {"N", "Q", "NYSE", "NASDAQ"}
+        query_upper = query.upper()
+
+        def _rank(result: dict[str, Any]) -> tuple[int, int]:
+            symbol = str(result.get("symbol") or "").upper()
+            if symbol == query_upper:
+                match_rank = 0
+            elif symbol and (symbol.startswith(query_upper) or query_upper.startswith(symbol)):
+                match_rank = 1
+            else:
+                match_rank = 2
+            exchange = str(result.get("exchange") or "").upper()
+            exchange_rank = 0 if exchange in preferred_exchanges else 1
+            return (match_rank, exchange_rank)
+
+        results.sort(key=_rank)
+        symbol = results[0].get("symbol")
+        if not symbol:
+            return None
+        return str(symbol).upper()
+
     def get_next_earnings_date(self, symbol: str) -> str | None:
         """Best-effort next earnings date via Tradier's beta fundamentals calendar.
 
