@@ -31,6 +31,11 @@
         "date": "2026-07-11",
         "option_mid": null,
         "dte": null
+      },
+      {
+        "date": "2026-07-12",
+        "option_mid": null,
+        "dte": null
       }
     ],
     "result": null,
@@ -73,7 +78,13 @@
     "score": 66.6,
     "thesis": "Tesla's Optimus humanoid robot program and autonomous systems infrastructure position it as a primary beneficiary of Stage 7 robotics acceleration. Recent capex intensity and FSD/autonomy software stack provide integrated hardware-software advantage for physical AI deployment.",
     "status": "open",
-    "checkpoints": [],
+    "checkpoints": [
+      {
+        "date": "2026-07-12",
+        "option_mid": 53.625,
+        "dte": 131
+      }
+    ],
     "result": null,
     "data_sources": [
       "arxiv_trends",
