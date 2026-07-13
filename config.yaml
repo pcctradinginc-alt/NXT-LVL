@@ -76,6 +76,16 @@ scoring:
   # against the digest (see src/analysis/phases.py verify_claims). A
   # candidate with no claims at all is unaffected (fraction=1.0 -> factor=1.0).
   claims_conviction_floor: 0.5
+  # Phase D — production validation gate + regime filter (CONCEPT_PROFIT.md):
+  # validation_gate=true means a tradeable Option signal is only emitted when
+  # data/scoring_calibration.json shows a validated (out-of-sample-passed)
+  # calibration; otherwise the run stays in observation-only mode (candidates
+  # + scores still computed/reported, just no trade). regime_gate=true means
+  # Long-Call signals are hard-blocked while regime_benchmark is below its
+  # 200-day SMA (risk-off).
+  validation_gate: true
+  regime_gate: true
+  regime_benchmark: "SPY"
 
 options:
   dte_min: 90

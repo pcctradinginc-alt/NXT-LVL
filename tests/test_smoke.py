@@ -1887,3 +1887,141 @@ def test_mailer_renders_iv_percentile():
     }
     _subject, html = build_email(result)
     assert "Perzentil" in html
+
+
+# ---------------------------------------------------------------------------
+# Phase D — production validation gate + regime filter (CONCEPT_PROFIT.md)
+# ---------------------------------------------------------------------------
+
+from src.analysis import calibration
+from src.main import _calibration_status, _regime_blocks
+
+
+def test_is_validated():
+    assert calibration.is_validated({"validation": {"passed": True}}) is True
+    assert calibration.is_validated({"validation": {"passed": False}}) is False
+    assert calibration.is_validated({"validation": {}}) is False
+    assert calibration.is_validated({}) is False
+    assert calibration.is_validated(None) is False
+    assert calibration.is_validated("not a dict") is False
+
+    calib_ok = {
+        "validation": {"passed": True},
+        "weights_final": {"breadth": 0.4, "divergence": 0.6},
+    }
+    assert calibration.validated_weights(calib_ok) == {"breadth": 0.4, "divergence": 0.6}
+
+    calib_bad = {"validation": {"passed": False}, "weights_final": {"breadth": 0.4}}
+    assert calibration.validated_weights(calib_bad) is None
+    assert calibration.validated_weights(None) is None
+    assert calibration.validated_weights({}) is None
+
+
+def test_calibration_load_from_temp_json(tmp_path: Path):
+    path = tmp_path / "scoring_calibration.json"
+    path.write_text(
+        json.dumps({"validation": {"passed": True}, "weights_final": {"breadth": 0.5, "divergence": 0.5}}),
+        encoding="utf-8",
+    )
+    calib = calibration.load_calibration(path)
+    assert calibration.is_validated(calib) is True
+    assert calibration.validated_weights(calib) == {"breadth": 0.5, "divergence": 0.5}
+
+    # Missing file -> None, never raises.
+    assert calibration.load_calibration(tmp_path / "does_not_exist.json") is None
+
+    # Malformed JSON -> None, never raises.
+    malformed_path = tmp_path / "malformed.json"
+    malformed_path.write_text("not json {{{", encoding="utf-8")
+    assert calibration.load_calibration(malformed_path) is None
+
+    # Valid JSON but not an object (e.g. a bare list) -> None.
+    list_path = tmp_path / "list.json"
+    list_path.write_text("[1, 2, 3]", encoding="utf-8")
+    assert calibration.load_calibration(list_path) is None
+
+    # An unvalidated (passed=False) calibration loads fine but never yields weights.
+    unvalidated_path = tmp_path / "unvalidated.json"
+    unvalidated_path.write_text(
+        json.dumps({"validation": {"passed": False}, "weights_final": {"breadth": 0.9}}),
+        encoding="utf-8",
+    )
+    unvalidated_calib = calibration.load_calibration(unvalidated_path)
+    assert calibration.is_validated(unvalidated_calib) is False
+    assert calibration.validated_weights(unvalidated_calib) is None
+
+
+def test_regime_gate_blocks():
+    # Confirmed risk-off (benchmark below its 200dma) -> blocks.
+    assert _regime_blocks(False) is True
+    # Confirmed risk-on -> never blocks.
+    assert _regime_blocks(True) is False
+    # Insufficient/unavailable history (None) fails OPEN -> never blocks on a data gap.
+    assert _regime_blocks(None) is False
+
+
+def test_validation_gate_blocks():
+    # No calibration file at all.
+    assert _calibration_status(None) == "fehlt"
+    # A calibration exists but did not validate out-of-sample.
+    assert _calibration_status({"validation": {"passed": False}}) == "passed=false"
+    assert _calibration_status({}) == "passed=false"
+    # A calibration exists and validated.
+    assert _calibration_status({"validation": {"passed": True}}) == "passed"
+
+    # The gate condition production code checks: validation_gate=True AND not
+    # is_validated(calib) -> observation mode / no tradeable signal.
+    assert calibration.is_validated(None) is False
+    assert calibration.is_validated({"validation": {"passed": False}}) is False
+    assert calibration.is_validated({"validation": {"passed": True}}) is True
+
+
+def test_mailer_observation_mode():
+    result = {
+        "stages_config": [],
+        "current_stage": None,
+        "next_stage": None,
+        "stage_reasoning": "",
+        "top_pick": None,
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+        "observation_mode": True,
+        "no_signal_reason": (
+            "Keine validierte Kante: Das Scoring hat im Out-of-Sample-Backtest (noch) keine "
+            "positive Kante gezeigt — Beobachtungsmodus, kein Trade-Signal. (Kalibrierung: fehlt)"
+        ),
+        "calibration_status": "fehlt",
+    }
+    subject, html = build_email(result)
+    assert "Beobachtungsmodus" in html
+    assert "Beobachtungsmodus" in subject
+    assert "Keine validierte Kante" in html
+    assert "keine Datenpanne" in html
+    assert "Kalibrierung: fehlt" in html
+
+
+def test_mailer_no_observation_mode_unaffected():
+    # Regression: a plain no_signal result WITHOUT observation_mode must keep
+    # rendering exactly the old way (subject unchanged, default reason text).
+    result = {
+        "stages_config": [],
+        "current_stage": None,
+        "next_stage": None,
+        "stage_reasoning": "",
+        "top_pick": None,
+        "top5": [],
+        "track_record": {"closed": 0, "open": 0, "hits": 0, "hit_rate": None, "avg_pnl_pct": None},
+    }
+    subject, html = build_email(result)
+    assert subject == "NXT LVL: Kein Signal heute"
+    assert "Kein Kandidat" in html
+    assert "Beobachtungsmodus" not in html
+
+
+def test_config_validation_and_regime_gate_defaults():
+    from src.config import load_settings
+
+    settings = load_settings()
+    assert settings.validation_gate is True
+    assert settings.regime_gate is True
+    assert settings.regime_benchmark == "SPY"

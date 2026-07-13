@@ -114,6 +114,7 @@ def add_signal(
     insider: dict[str, Any] | None = None,
     rs: dict[str, Any] | None = None,
     iv_percentile: float | None = None,
+    trend_ok: bool | None = None,
 ) -> dict[str, Any]:
     """Create and persist a new open signal. Returns the created signal dict.
 
@@ -162,6 +163,9 @@ def add_signal(
         "rs": rs,
         # --- IV-rank forward (#6) ---
         "iv_percentile": iv_percentile,
+        # --- Trend filter (Phase D, CONCEPT_PROFIT.md): a RISK FLAG stored
+        # for forward measurement, not a hard gate (the regime gate is). ---
+        "trend_ok": trend_ok,
     }
     signals.append(signal)
     save_signals(signals, path)

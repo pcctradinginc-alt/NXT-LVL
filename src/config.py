@@ -86,6 +86,31 @@ class Settings:
         return int(self.options_config.get("iv_history_min_samples", 8))
 
     @property
+    def validation_gate(self) -> bool:
+        """Phase D validation gate: only emit a tradeable signal when
+
+        `data/scoring_calibration.json` shows a validated (validation.passed
+        is True) out-of-sample edge (see src/analysis/calibration.py). When
+        True (the default) and no such calibration exists, the run stays in
+        observation-only mode instead of emitting a trade.
+        """
+        return bool(self.scoring.get("validation_gate", True))
+
+    @property
+    def regime_gate(self) -> bool:
+        """Phase D regime gate: hard-block Long-Call signals when
+
+        `regime_benchmark` is below its 200-day SMA (risk-off), per
+        src.analysis.trend.regime_risk_on. Default True.
+        """
+        return bool(self.scoring.get("regime_gate", True))
+
+    @property
+    def regime_benchmark(self) -> str:
+        """Phase D: benchmark ticker used by the regime gate (default SPY)."""
+        return str(self.scoring.get("regime_benchmark", "SPY"))
+
+    @property
     def claims_conviction_floor(self) -> float:
         """Machine-checkable-claims gate (#18): floor of the total_score dampening
 

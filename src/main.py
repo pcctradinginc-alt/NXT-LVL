@@ -23,10 +23,10 @@ from pathlib import Path
 from typing import Any
 
 from src import tracking
-from src.analysis import earnings
+from src.analysis import calibration, earnings
 from src.analysis import insider as insider_mod
 from src.analysis import iv_rank
-from src.analysis import llm, phases, scoring, structures
+from src.analysis import llm, phases, scoring, structures, trend
 from src.collectors import arxiv_trends, edgar_capex, edgar_fts, edgar_language, github_trends, hn_buzz, jobs_hn
 from src.config import DATA_DIR, Settings, load_settings
 from src.emergence import baseline as baseline_mod
@@ -283,6 +283,28 @@ def _drop_megacaps(candidates: list[dict[str, Any]], exclude: list[str]) -> list
     return kept
 
 
+def _regime_blocks(risk_on: bool | None) -> bool:
+    """Pure predicate for the regime gate (CONCEPT_PROFIT.md Phase D).
+
+    True only when `trend.regime_risk_on(...)` returned a CONFIRMED False
+    (risk-off: benchmark below its 200-day SMA). `None` (insufficient or
+    unavailable history) fails OPEN — a data gap must never suppress a
+    signal on its own, only a measured risk-off regime does.
+    """
+    return risk_on is False
+
+
+def _calibration_status(calib: dict[str, Any] | None) -> str:
+    """German status word for the no-signal reason / email footer.
+
+    "fehlt" when no calibration file exists at all, "passed=false" when one
+    exists but did not show out-of-sample edge, "passed" when it did.
+    """
+    if calib is None:
+        return "fehlt"
+    return "passed" if calibration.is_validated(calib) else "passed=false"
+
+
 def compute_risks(
     top_pick: dict[str, Any] | None,
     option: dict[str, Any] | None,
@@ -440,6 +462,8 @@ def build_result(
     reward_status: dict[str, Any] | None = None,
     no_signal_reason: str | None = None,
     edgar_language: dict[str, Any] | None = None,
+    observation_mode: bool = False,
+    calibration_status: str | None = None,
 ) -> dict[str, Any]:
     return {
         "stages_config": settings.stages,
@@ -459,6 +483,8 @@ def build_result(
         "reward": reward_status,
         "no_signal_reason": no_signal_reason,
         "edgar_language": edgar_language,
+        "observation_mode": observation_mode,
+        "calibration_status": calibration_status,
     }
 
 
@@ -602,6 +628,27 @@ def run(dry_run: bool = False) -> int:
     effective_weights = weights_mod.get_effective_weights(settings.scoring_weights, WEIGHTS_PATH)
     effective_reliability = weights_mod.current_reliability(weights_obj)
     all_theme_scores = emergence_result.get("all_theme_scores", {})
+
+    # Phase D validation-gate weights (CONCEPT_PROFIT.md): read once here and
+    # reused by the validation gate further below (avoids reading the file
+    # twice per run). When src/backtest/optimize.py produced a VALIDATED
+    # out-of-sample calibration, its weights_final become the effective
+    # scoring weights for this run — merged over the config/reward-engine
+    # weights, so any weighted component the calibration doesn't cover keeps
+    # its existing config/reward value rather than being dropped.
+    calib = calibration.load_calibration()
+    calibrated_weights = calibration.validated_weights(calib)
+    if calibrated_weights:
+        effective_weights = {**effective_weights, **calibrated_weights}
+        logger.info(
+            "Validation gate: validated calibration weights in effect (from %s): %s",
+            calibration.CALIBRATION_PATH,
+            calibrated_weights,
+        )
+    else:
+        logger.info(
+            "Validation gate: no validated calibration weights — using config/reward-engine weights"
+        )
 
     # 6. LLM analysis (digest now includes emergence_summary, see step 2)
     if dry_run:
@@ -814,6 +861,63 @@ def run(dry_run: bool = False) -> int:
             logger.info("Cluster gate fired for %s: %s", top_pick.get("ticker"), no_signal_reason)
             top_pick = None
 
+    # 9c. Regime gate (CONCEPT_PROFIT.md Phase D): a genuine risk-off regime
+    # (settings.regime_benchmark, e.g. SPY, below its 200-day SMA) hard-blocks
+    # Long-Call signals — trend-following calls get run over in a broad
+    # risk-off market, and not-trading is itself a valid, often profitable
+    # outcome (see CONCEPT_PROFIT.md). Skipped in dry-run / without Tradier
+    # (no history to fetch); insufficient/unavailable history fails OPEN
+    # (never blocks on a data gap — see _regime_blocks).
+    if top_pick is not None and settings.regime_gate and not dry_run and tradier_client is not None:
+        risk_on: bool | None = None
+        try:
+            regime_hist_start = (date.today() - timedelta(days=400)).strftime("%Y-%m-%d")
+            regime_history = tradier_client.get_history(settings.regime_benchmark, start=regime_hist_start)
+            regime_closes = [
+                bar.get("close")
+                for bar in regime_history
+                if isinstance(bar, dict) and bar.get("close") is not None
+            ]
+            risk_on = trend.regime_risk_on(regime_closes)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Regime gate history fetch failed for %s, not blocking: %s", settings.regime_benchmark, exc
+            )
+            risk_on = None
+
+        if risk_on is None:
+            logger.info(
+                "Regime gate: insufficient/unavailable history for %s, not blocking", settings.regime_benchmark
+            )
+        elif _regime_blocks(risk_on):
+            no_signal_reason = (
+                f"Risk-off-Regime: {settings.regime_benchmark} unter 200-Tage-Linie — "
+                "keine Long-Call-Signale in diesem Regime."
+            )
+            logger.info("Regime gate fired for %s: %s", top_pick.get("ticker"), no_signal_reason)
+            top_pick = None
+
+    # 9d. Validation gate (CONCEPT_PROFIT.md Phase D): the production system
+    # only emits a tradeable Option signal when src/backtest/optimize.py
+    # produced a calibration with a VALIDATED (out-of-sample, `calib` loaded
+    # once above alongside effective_weights) edge. Otherwise the honest
+    # answer is "no validated edge" — the run stays in OBSERVATION MODE:
+    # candidates/scores/stage-distribution/emergence are still computed,
+    # archived (digest_history, step 12b below), and reported in the email so
+    # the forward record keeps growing; only the tradeable Option signal is
+    # withheld.
+    observation_mode = False
+    calibration_status = _calibration_status(calib)
+    if settings.validation_gate and not calibration.is_validated(calib):
+        observation_mode = True
+        no_signal_reason = (
+            "Keine validierte Kante: Das Scoring hat im Out-of-Sample-Backtest (noch) keine "
+            "positive Kante gezeigt — Beobachtungsmodus, kein Trade-Signal. "
+            f"(Kalibrierung: {calibration_status})"
+        )
+        logger.info("Validation gate fired: %s", no_signal_reason)
+        top_pick = None
+
     # 10. Option selection + divergence rescoring for the chosen top pick
     option = None
     three_month_perf = None
@@ -822,6 +926,7 @@ def run(dry_run: bool = False) -> int:
     edate = None
     earnings_trap = False
     earnings_risk_msg = None
+    trend_ok_val: bool | None = None
     closes: list[float] = []
     if top_pick is not None:
         ticker = top_pick["ticker"]
@@ -850,9 +955,13 @@ def run(dry_run: bool = False) -> int:
             # (`closes` was already initialized to [] above the `if top_pick is
             # not None:` branch so it's always defined even when this whole
             # `else:` — dry-run / no Tradier key — is skipped.)
+            # History window is 400 calendar days (not just the ~130 rvol
+            # needs) so the SAME fetch also covers the Phase D trend filter's
+            # >=200-cleaned-close requirement (trend.trend_ok) — one Tradier
+            # call serves both, no redundant fetch.
             if option is not None:
                 try:
-                    hist_start = (date.today() - timedelta(days=130)).strftime("%Y-%m-%d")
+                    hist_start = (date.today() - timedelta(days=400)).strftime("%Y-%m-%d")
                     history = tradier_client.get_history(ticker, start=hist_start)
                     closes = [
                         bar.get("close")
@@ -863,6 +972,16 @@ def run(dry_run: bool = False) -> int:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("realized_vol computation failed for %s: %s", ticker, exc)
                     rvol = None
+
+                # Trend filter (#2 concept, CONCEPT_PROFIT.md Phase D): a RISK
+                # FLAG only, never a hard block (the regime gate above is the
+                # hard one) — surfaced as a risk string + persisted on the
+                # signal for forward measurement.
+                try:
+                    trend_ok_val = trend.trend_ok(closes)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("trend_ok computation failed for %s: %s", ticker, exc)
+                    trend_ok_val = None
 
                 short_leg = None
                 try:
@@ -974,6 +1093,11 @@ def run(dry_run: bool = False) -> int:
         )
         if earnings_risk_msg:
             risks.append(earnings_risk_msg)
+        if trend_ok_val is False:
+            risks.append(
+                "Kurs unter dem Aufwärtstrend (nicht Kurs>50-Tage>200-Tage-Linie) — "
+                "Gegentrend-Signal, erhöhtes Risiko."
+            )
         top_pick["risks"] = risks
 
         # Persist the new signal (only for real runs where we'd actually track it)
@@ -1106,6 +1230,7 @@ def run(dry_run: bool = False) -> int:
                 insider=insider_signal,
                 rs=rs_signal,
                 iv_percentile=iv_pct,
+                trend_ok=trend_ok_val,
             )
 
     # 12. Track record stats
@@ -1146,6 +1271,8 @@ def run(dry_run: bool = False) -> int:
         reward_status=reward_status,
         no_signal_reason=no_signal_reason,
         edgar_language=digest.get("edgar_language"),
+        observation_mode=observation_mode,
+        calibration_status=calibration_status,
     )
     subject, html = build_email(result)
 

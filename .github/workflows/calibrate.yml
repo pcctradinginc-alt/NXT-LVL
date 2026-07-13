@@ -1,0 +1,108 @@
+name: Scoring Calibration
+
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start date YYYY-MM-DD (optional; blank = CLI default, 3 years before --end)"
+        required: false
+        type: string
+        default: ""
+      end:
+        description: "End date YYYY-MM-DD (optional; blank = CLI default, today minus the longest horizon)"
+        required: false
+        type: string
+        default: ""
+      cadence:
+        description: "Days between as-of samples (optional; blank = CLI default, 30)"
+        required: false
+        type: string
+        default: ""
+      folds:
+        description: "Number of time folds (optional; blank = CLI default, 4)"
+        required: false
+        type: string
+        default: ""
+  schedule:
+    # Monthly re-calibration: 1st of the month, 12:00 UTC (independent of
+    # backtest.yml / scan.yml's own schedules). data/scoring_calibration.json
+    # is what src/main.py's Phase D validation gate reads on every scan run,
+    # so keeping it fresh keeps production honest about whether an
+    # out-of-sample edge is still validated.
+    - cron: "0 12 1 * *"
+
+permissions:
+  contents: write
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Same cache scheme as backtest.yml: src/backtest/optimize.py runs a
+      # full walk-forward (walkforward.run_walkforward) under the hood to
+      # produce its samples, so a warm cache here keeps this well under the
+      # timeout too. Completed calendar months are immutable, so the cache
+      # from backtest.yml runs is directly reusable here and vice versa.
+      - name: Restore backtest cache
+        uses: actions/cache@v4
+        with:
+          path: data/backtest_cache
+          key: backtest-cache-v1-${{ github.run_id }}
+          restore-keys: |
+            backtest-cache-v1-
+
+      - name: Run scoring calibration against live Tradier history
+        env:
+          TRADIER_API_KEY: ${{ secrets.TRADIER_API_KEY }}
+          TRADIER_ENV: ${{ vars.TRADIER_ENV }}
+        run: |
+          ARGS=()
+          if [ -n "${{ inputs.start }}" ]; then
+            ARGS+=(--start "${{ inputs.start }}")
+          fi
+          if [ -n "${{ inputs.end }}" ]; then
+            ARGS+=(--end "${{ inputs.end }}")
+          fi
+          if [ -n "${{ inputs.cadence }}" ]; then
+            ARGS+=(--cadence "${{ inputs.cadence }}")
+          fi
+          if [ -n "${{ inputs.folds }}" ]; then
+            ARGS+=(--folds "${{ inputs.folds }}")
+          fi
+          python -m src.backtest.optimize "${ARGS[@]}"
+
+      - name: Commit and push data/scoring_calibration.json if changed
+        run: |
+          git config user.name "nxt-lvl-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/scoring_calibration.json
+          if git diff --cached --quiet; then
+            echo "No calibration changes to commit."
+          else
+            git commit -m "Update scoring calibration [skip ci]"
+            # Rebase onto any concurrent push (e.g. a scan.yml track-record
+            # commit) before pushing, so this never fails on a non-fast-forward.
+            git pull --rebase --autostash origin main || true
+            git push
+          fi
+
+      - name: Upload calibration artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scoring-calibration
+          path: data/scoring_calibration.json
+          if-no-files-found: warn

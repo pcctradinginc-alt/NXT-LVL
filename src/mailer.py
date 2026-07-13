@@ -436,6 +436,17 @@ def _render_reward_status(reward: dict[str, Any] | None) -> str:
     """
 
 
+def _calibration_status_label(status: str | None) -> str:
+    """German display label for `result["calibration_status"]` (Phase D).
+
+    Maps src.main._calibration_status()'s raw values ("passed",
+    "passed=false", "fehlt") to the one-line footer wording requested by
+    CONCEPT_PROFIT.md Phase D. Unknown values are shown verbatim rather than
+    hidden, so a future status string never silently disappears.
+    """
+    return {"passed": "passed", "passed=false": "nicht validiert", "fehlt": "fehlt"}.get(status, str(status))
+
+
 def build_email(result: dict[str, Any]) -> tuple[str, str]:
     """Build (subject, html_body) from a pipeline result dict.
 
@@ -529,11 +540,26 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     else:
         subject = "NXT LVL: Kein Signal heute"
         no_signal_reason = result.get("no_signal_reason")
-        no_signal_text = no_signal_reason or (
-            "Kein Kandidat hat heute den Signal-Schwellwert (Score &ge; 70, "
-            "mindestens 2 unabhängige Quellen) erreicht oder war im Cooldown. Kein Signal ist ein "
-            "gültiges Ergebnis &mdash; Qualität vor Quantität."
-        )
+        observation_mode = bool(result.get("observation_mode"))
+        # Phase D (CONCEPT_PROFIT.md): observation_mode means the scoring has
+        # not (yet) shown a validated out-of-sample edge — make this reads as
+        # a deliberate "Beobachtung, kein Trade" state, NOT a data failure or
+        # an ordinary "no candidate today" outcome.
+        if observation_mode:
+            subject = "NXT LVL: Beobachtungsmodus (keine validierte Kante)"
+            no_signal_text = (
+                "<strong>Beobachtungsmodus &mdash; kein Trade-Signal, keine Datenpanne:</strong><br>"
+                + (
+                    no_signal_reason
+                    or "Das Scoring hat im Out-of-Sample-Backtest (noch) keine validierte Kante gezeigt."
+                )
+            )
+        else:
+            no_signal_text = no_signal_reason or (
+                "Kein Kandidat hat heute den Signal-Schwellwert (Score &ge; 70, "
+                "mindestens 2 unabhängige Quellen) erreicht oder war im Cooldown. Kein Signal ist ein "
+                "gültiges Ergebnis &mdash; Qualität vor Quantität."
+            )
         top_pick_html = f"""
         <div class="card">
           <h2>Top-Pick</h2>
@@ -569,6 +595,17 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     filing_language_html = _render_filing_language(result.get("edgar_language"))
     reward_html = _render_reward_status(result.get("reward"))
 
+    # Phase D (CONCEPT_PROFIT.md): one-line calibration status in the footer,
+    # whenever the pipeline reported one (result["calibration_status"], set
+    # by src/main.py's validation gate). Omitted entirely for older result
+    # dicts / tests that don't carry this key.
+    calibration_line = ""
+    calibration_status = result.get("calibration_status")
+    if calibration_status:
+        calibration_line = (
+            f'<div class="footer">Kalibrierung: {_calibration_status_label(calibration_status)}</div>'
+        )
+
     html = f"""<!DOCTYPE html>
 <html lang="de">
 <head><meta charset="utf-8"><style>{BASE_STYLE}</style></head>
@@ -592,6 +629,7 @@ def build_email(result: dict[str, Any]) -> tuple[str, str]:
     </div>
     {reward_html}
     <div class="footer">{DISCLAIMER_HTML}</div>
+    {calibration_line}
   </div>
 </body>
 </html>"""
