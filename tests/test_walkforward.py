@@ -290,6 +290,66 @@ def test_run_walkforward_mock_flag_generates_synthetic_digests():
     assert report["params"]["mock"] is True
 
 
+def test_walkforward_includes_samples_when_requested():
+    """CONCEPT_PROFIT.md Phase C: run_walkforward(..., include_samples=True)
+    exposes report["samples"] (compact per-(ticker, as_of) records) so the
+    optimizer can recalibrate WITHOUT re-fetching; each record carries the new
+    momentum_12_1 component plus the trend_ok/regime_risk_on gate flags. Also
+    checks that the report gained ic_by_component["*"]["momentum_12_1"] and a
+    filtered_buckets block, and that samples stay OFF by default.
+    """
+    tickers = ["TA", "TB"]
+    benchmarks = ("SPY",)
+    themes = [
+        {"id": "th1", "keywords": ["mockkeyword1"], "tickers": ["TA"]},
+        {"id": "th2", "keywords": ["mockkeyword2"], "tickers": ["TB"]},
+    ]
+    start = date(2023, 1, 2)
+    end = date(2023, 6, 1)
+    price_series = _build_price_series(list(tickers) + list(benchmarks), start, end, seed=11)
+    mock_digests = _build_mock_digests(["th1", "th2"], start, end)
+
+    common = dict(
+        start=start,
+        end=end,
+        cadence_days=30,
+        horizons=(30, 60, 90),
+        benchmarks=benchmarks,
+        price_series=price_series,
+        mock_digests=mock_digests,
+    )
+
+    # Off by default.
+    report_default = walkforward.run_walkforward(None, tickers, themes, **common)
+    assert "samples" not in report_default
+    # momentum_12_1 is now an IC-measured component; filtered_buckets is present.
+    assert "momentum_12_1" in report_default["ic_by_component"]["90"]
+    assert "filtered_buckets" in report_default
+    fb = report_default["filtered_buckets"]
+    assert set(("horizon", "n_gated", "underlying", "option")) <= set(fb.keys())
+
+    # On when requested.
+    report = walkforward.run_walkforward(None, tickers, themes, include_samples=True, **common)
+    assert "samples" in report
+    samples = report["samples"]
+    assert isinstance(samples, list) and len(samples) == report["n_samples"] > 0
+
+    for s in samples:
+        assert set(("as_of", "ticker", "components", "trend_ok", "regime_risk_on", "fwd", "opt")) <= set(s.keys())
+        # the four weighted components, including the new momentum factor
+        for comp in ("divergence", "theme_momentum", "breadth", "momentum_12_1"):
+            assert comp in s["components"]
+        # gate flags are True/False/None (never missing)
+        assert s["trend_ok"] in (True, False, None)
+        assert s["regime_risk_on"] in (True, False, None)
+        # forward + option maps cover every requested horizon, values are numbers or None
+        for h_key in ("30", "60", "90"):
+            assert h_key in s["fwd"]
+            assert s["fwd"][h_key] is None or isinstance(s["fwd"][h_key], (int, float))
+            assert h_key in s["opt"]
+            assert s["opt"][h_key] is None or isinstance(s["opt"][h_key], (int, float))
+
+
 def test_run_walkforward_no_data_returns_empty_but_well_formed():
     """No tradier, no price_series, no mock_digests, mock=False: every price
     lookup degrades to empty/None gracefully rather than raising, and the

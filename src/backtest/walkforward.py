@@ -63,7 +63,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from src.analysis import scoring
+from src.analysis import scoring, trend
 from src.analysis.options_math import bs_call_price, solve_strike_for_delta
 from src.backtest.calibrate import spearman
 from src.backtest.price_backtest import (
@@ -93,6 +93,20 @@ DEFAULT_BENCHMARKS: tuple[str, ...] = ("SPY", "QQQ", "SOXX")
 DEFAULT_RECONSTRUCT_WINDOW_DAYS = 90
 SOURCES = ("edgar_fts", "arxiv", "hn_buzz", "jobs")
 
+# Phase B trend/regime gate (CONCEPT_PROFIT.md): the regime gate always reads
+# SPY specifically (broad-market risk-on/off proxy), independent of whichever
+# ticker/theme is being scored and independent of DEFAULT_BENCHMARKS' order.
+REGIME_BENCHMARK = "SPY"
+
+# momentum_12_1 (src.analysis.trend) needs >=253 daily closes ending ~1 month
+# before as_of; trend_ok/regime_risk_on need >=200. 400 calendar days safely
+# covers 253 trading days even accounting for weekends/holidays. Used to
+# widen the very first (cold-cache) per-ticker price fetch in run_walkforward
+# (see _price_map_for's `history_start`) so every as-of date in a run has
+# enough trailing history for these components rather than silently falling
+# back to trend.py's neutral/None on the earliest as-of dates only.
+MOMENTUM_LOOKBACK_CALENDAR_DAYS = 400
+
 # arXiv rate-limit hygiene: >=3.0s spacing between actual network calls
 # (module-level last-call timestamp, shared across every theme/month query in
 # the process), plus exponential backoff specifically on HTTP 429 before
@@ -118,10 +132,23 @@ OPTION_SPREAD_PCT = 0.06
 # intentionally simpler than scoring.DEFAULT_WEIGHTS (no option_quality /
 # stage_fit / emergence — those either need live option chains or the full
 # emergence pipeline, neither of which is point-in-time reconstructable).
+#
+# CONCEPT_PROFIT.md Phase B/C: the first real walk-forward run (2026-07-12,
+# n=96) measured breadth at IC=-0.305 and divergence at IC=-0.169 @90d (both
+# anti-predictive on that sample), theme_momentum at IC=+0.051 (the only
+# positive candidate), and had no price-momentum factor at all. These
+# defaults react to that finding — momentum_12_1 (the best-documented free
+# momentum factor, Phase B #1) gets the largest weight, theme_momentum keeps
+# its prior (only-positive-so-far) weight, and divergence/breadth are cut
+# back since neither has earned default trust. These are still just a
+# starting point, not a claim of edge: `src/backtest/optimize.py` (Phase C)
+# recalibrates weights from measured out-of-sample IC, and *that* calibration
+# is what should actually gate production scoring, not these defaults.
 WALKFORWARD_WEIGHTS = {
-    "divergence": 0.40,
-    "theme_momentum": 0.35,
-    "breadth": 0.25,
+    "divergence": 0.20,
+    "theme_momentum": 0.30,
+    "breadth": 0.10,
+    "momentum_12_1": 0.40,
 }
 
 HEADER_LINE = (
@@ -834,6 +861,43 @@ def _trailing_perf_pct_asof(
     return (end_close - start_close) / start_close * 100.0
 
 
+def _trailing_closes_asof(
+    ticker: str,
+    as_of_date: date,
+    tradier: TradierClient | None,
+    price_series: dict[str, dict[str, float]] | None,
+    *,
+    lookback_days: int = MOMENTUM_LOOKBACK_CALENDAR_DAYS,
+    price_cache: dict[str, dict[date, float]] | None = None,
+    history_start: date | None = None,
+) -> list[float]:
+    """Chronological (oldest-first) daily closes for `ticker` up to and
+    including the nearest trading day <= as_of_date.
+
+    Feeds src.analysis.trend's momentum_12_1/trend_ok/regime_risk_on, which
+    already handle too-short input gracefully (None/neutral rather than
+    raising) — see trend.py's module docstring — so this helper doesn't need
+    to enforce a minimum length itself; it just hands over whatever history
+    is available in the price map.
+    """
+    price_map = _price_map_for(
+        ticker,
+        tradier,
+        price_series,
+        as_of_date,
+        lookback_days=lookback_days,
+        price_cache=price_cache,
+        history_start=history_start,
+    )
+    if not price_map:
+        return []
+    sorted_dates = sorted(price_map.keys())
+    end_date = _nearest_trading_day(sorted_dates, as_of_date, allow_after=False)
+    if end_date is None:
+        return []
+    return [price_map[d] for d in sorted_dates if d <= end_date]
+
+
 def score_universe_asof(
     as_of_date: date,
     tickers: list[str],
@@ -844,6 +908,7 @@ def score_universe_asof(
     price_series: dict[str, dict[str, float]] | None = None,
     price_cache: dict[str, dict[date, float]] | None = None,
     history_start: date | None = None,
+    benchmark: str = REGIME_BENCHMARK,
 ) -> list[dict[str, Any]]:
     """Simplified as-of score for each ticker, from reconstructable components only.
 
@@ -853,21 +918,49 @@ def score_universe_asof(
     mapped to no theme), theme_momentum falls back to neutral (50) and
     breadth to 0 (no thematic evidence found for that ticker).
 
+    CONCEPT_PROFIT.md Phase B adds:
+      - momentum_12_1: trend.score_momentum_12_1() of the ticker's trailing
+        closes up to and including as_of — a WEIGHTED component like the
+        other three (see WALKFORWARD_WEIGHTS).
+      - trend_ok / regime_risk_on: trend.trend_ok() (ticker) and
+        trend.regime_risk_on() (the `benchmark`, default SPY), both evaluated
+        as-of the same date. These are GATES, not weighted score inputs —
+        stored as metadata on each result so run_walkforward can measure
+        (via `filtered_buckets`) whether restricting to trend_ok AND
+        regime_risk_on actually improves outcomes, rather than assuming it
+        does. Each is True/False, or None when there isn't enough trailing
+        history (see src.analysis.trend) to evaluate it — None is a distinct,
+        honest "unknown", not coerced to True or False.
+
     Returns a list of
-      {"ticker", "as_of", "components": {"divergence", "theme_momentum", "breadth"},
-       "total", "source_signals": {source: raw_current_count}}
+      {"ticker", "as_of",
+       "components": {"divergence", "theme_momentum", "breadth", "momentum_12_1"},
+       "total", "source_signals": {source: raw_current_count},
+       "trend_ok": bool | None, "regime_risk_on": bool | None}
     (the extra "source_signals" field feeds the lead-lag analysis in
     run_walkforward and is not part of the documented minimal contract).
     """
     themes = themes or []
     ticker_theme_map = _ticker_theme_ids(tickers, themes)
 
+    # Regime gate is a function of (benchmark, as_of_date) only — the same
+    # for every ticker at this as_of date — so it's computed once here
+    # rather than once per ticker.
+    benchmark_closes = _trailing_closes_asof(
+        benchmark, as_of_date, tradier, price_series, price_cache=price_cache, history_start=history_start
+    )
+    regime_on = trend.regime_risk_on(benchmark_closes)
+
     results: list[dict[str, Any]] = []
     for ticker in tickers:
+        trailing_closes = _trailing_closes_asof(
+            ticker, as_of_date, tradier, price_series, price_cache=price_cache, history_start=history_start
+        )
         perf_3m = _trailing_perf_pct_asof(
             ticker, as_of_date, tradier, price_series, price_cache=price_cache, history_start=history_start
         )
         divergence = scoring.score_divergence(perf_3m)
+        momentum_12_1 = trend.score_momentum_12_1(trailing_closes)
 
         theme_ids = ticker_theme_map.get(ticker, [])
         signal = _theme_signal(theme_ids, digest)
@@ -878,6 +971,7 @@ def score_universe_asof(
             divergence * WALKFORWARD_WEIGHTS["divergence"]
             + theme_momentum * WALKFORWARD_WEIGHTS["theme_momentum"]
             + breadth * WALKFORWARD_WEIGHTS["breadth"]
+            + momentum_12_1 * WALKFORWARD_WEIGHTS["momentum_12_1"]
         )
 
         results.append(
@@ -888,9 +982,12 @@ def score_universe_asof(
                     "divergence": round(divergence, 2),
                     "theme_momentum": round(theme_momentum, 2),
                     "breadth": round(breadth, 2),
+                    "momentum_12_1": round(momentum_12_1, 2),
                 },
                 "total": round(total, 2),
                 "source_signals": dict(signal["current"]),
+                "trend_ok": trend.trend_ok(trailing_closes),
+                "regime_risk_on": regime_on,
             }
         )
     return results
@@ -1162,7 +1259,7 @@ def _aggregate_bucket(items: list[dict[str, Any]], horizon_key: str, primary_ben
 
 
 def _build_ic(samples: list[dict[str, Any]], horizons: tuple[int, ...]) -> dict[str, Any]:
-    components = ("divergence", "theme_momentum", "breadth", "total")
+    components = ("divergence", "theme_momentum", "breadth", "momentum_12_1", "total")
     out: dict[str, Any] = {}
     for h in horizons:
         h_key = str(h)
@@ -1185,6 +1282,36 @@ def _build_buckets(samples: list[dict[str, Any]], horizons: tuple[int, ...], pri
         bucketed = _bucket_by_quartile(valid)
         out[h_key] = {label: _aggregate_bucket(items, h_key, primary_benchmark) for label, items in bucketed.items()}
     return out
+
+
+def _build_filtered_buckets(
+    samples: list[dict[str, Any]], primary_benchmark: str | None, horizon_key: str = "90"
+) -> dict[str, Any]:
+    """CONCEPT_PROFIT.md Phase B/C: does gating on trend_ok AND regime_risk_on
+    actually help? Restricts to the subset of `samples` where both gates are
+    True (None — insufficient trailing history, see src.analysis.trend — is
+    treated as "gate not confirmed", i.e. excluded, not assumed to pass), then
+    reports the TOP quartile's underlying (`_aggregate_bucket`) and synthetic
+    option (`_aggregate_option_bucket`) metrics at `horizon_key` — the same
+    aggregation `_build_buckets`/`_build_option_buckets` use for the ungated
+    report, so the two are directly comparable.
+    """
+    gated = [s for s in samples if s.get("trend_ok") is True and s.get("regime_risk_on") is True]
+
+    valid_underlying = [s for s in gated if s["forward"].get(horizon_key) is not None]
+    top_underlying = _bucket_by_quartile(valid_underlying).get("Q4", [])
+    underlying = _aggregate_bucket(top_underlying, horizon_key, primary_benchmark)
+
+    valid_option = [s for s in gated if (s.get("option") or {}).get(horizon_key) is not None]
+    top_option = _bucket_by_quartile(valid_option).get("Q4", [])
+    option = _aggregate_option_bucket(top_option, horizon_key)
+
+    return {
+        "horizon": horizon_key,
+        "n_gated": len(gated),
+        "underlying": underlying,
+        "option": option,
+    }
 
 
 def _compute_lead_lag(samples: list[dict[str, Any]], horizons: tuple[int, ...]) -> dict[str, Any]:
@@ -1255,6 +1382,47 @@ def _compute_temporal_ordering(samples: list[dict[str, Any]], primary_benchmark:
     }
 
 
+def _compact_samples(samples: list[dict[str, Any]], horizons: tuple[int, ...]) -> list[dict[str, Any]]:
+    """Compact per-(ticker, as_of) records for `report["samples"]` (only
+    populated when `run_walkforward(..., include_samples=True)`) — enough for
+    `src/backtest/optimize.py` to recompute total scores under different
+    weights and validate out-of-sample WITHOUT re-fetching any digest/price
+    data:
+
+      {"as_of", "ticker", "components": {divergence, theme_momentum, breadth,
+       momentum_12_1}, "trend_ok", "regime_risk_on",
+       "fwd": {horizon_str: pct_return | None},
+       "opt": {horizon_str: option_pct_return | None}}
+
+    `fwd`/`opt` cover every horizon in `horizons` (not just "90") so a caller
+    can calibrate/validate against any horizon, not only the primary one;
+    values are None wherever the underlying `forward`/`option` entry wasn't
+    available for that (ticker, as_of, horizon) — never fabricated.
+    """
+    compact: list[dict[str, Any]] = []
+    for s in samples:
+        fwd: dict[str, float | None] = {}
+        opt: dict[str, float | None] = {}
+        for h in horizons:
+            h_key = str(h)
+            fwd_entry = s["forward"].get(h_key)
+            fwd[h_key] = fwd_entry["abs"] if fwd_entry is not None else None
+            opt_entry = (s.get("option") or {}).get(h_key)
+            opt[h_key] = opt_entry["return"] if opt_entry is not None else None
+        compact.append(
+            {
+                "as_of": s["as_of"],
+                "ticker": s["ticker"],
+                "components": dict(s["components"]),
+                "trend_ok": s.get("trend_ok"),
+                "regime_risk_on": s.get("regime_risk_on"),
+                "fwd": fwd,
+                "opt": opt,
+            }
+        )
+    return compact
+
+
 def run_walkforward(
     tradier: TradierClient | None,
     tickers: list[str],
@@ -1268,6 +1436,7 @@ def run_walkforward(
     mock: bool = False,
     price_series: dict[str, dict[str, float]] | None = None,
     mock_digests: dict[str, dict[str, Any]] | None = None,
+    include_samples: bool = False,
 ) -> dict[str, Any]:
     """Run the full walk-forward backtest across an as-of date grid.
 
@@ -1300,11 +1469,23 @@ def run_walkforward(
     already cover a given date (offline/test paths never hit disk).
 
     Returns a report dict with `params`, `n_samples`, `ic_by_component` (per
-    horizon), `buckets` (hit-rate & avg alpha by total-score quartile, per
-    horizon), `option_by_quartile` (synthetic 120-DTE delta-0.60 call hit-rate
-    & avg return by quartile @90d — see `_compute_option_metrics`),
-    `lead_lag` (#6), `temporal_ordering` (#12), `degraded_buckets` (count of
-    excluded arXiv-429-exhausted monthly buckets), and `notes`.
+    horizon, now including momentum_12_1 — CONCEPT_PROFIT.md Phase B),
+    `buckets` (hit-rate & avg alpha by total-score quartile, per horizon),
+    `option_by_quartile` (synthetic 120-DTE delta-0.60 call hit-rate & avg
+    return by quartile @90d — see `_compute_option_metrics`),
+    `filtered_buckets` (Phase B/C: top-quartile underlying+option metrics
+    restricted to samples where trend_ok AND regime_risk_on are both True —
+    see `_build_filtered_buckets` — measuring whether the trend/regime gates
+    actually help), `lead_lag` (#6), `temporal_ordering` (#12),
+    `degraded_buckets` (count of excluded arXiv-429-exhausted monthly
+    buckets), and `notes`.
+
+    `include_samples`, when True, additionally sets `report["samples"]` to a
+    compact per-(ticker, as_of) list — components, trend_ok/regime_risk_on,
+    forward returns and option returns by horizon — so
+    `src/backtest/optimize.py` can recalibrate weights and validate
+    out-of-sample WITHOUT re-fetching any data. Off by default so the report
+    written by this module's own CLI/workflow stays small.
     """
     theme_ids = [t.get("id") for t in themes if t.get("id")]
     as_of_grid = _asof_grid(start, end, cadence_days)
@@ -1315,9 +1496,12 @@ def run_walkforward(
     # so the first fetch for any ticker (traded or benchmark) covers every
     # as-of date/horizon used anywhere in this run. See _price_map_for's
     # docstring for why this is the single biggest lever against the
-    # multi-hour hangs a naive per-call fetch produced.
+    # multi-hour hangs a naive per-call fetch produced. Widened (Phase B) to
+    # also cover momentum_12_1's ~253-trading-day trailing requirement, not
+    # just the option-IV window, so early as-of dates aren't starved of
+    # history relative to later ones (see MOMENTUM_LOOKBACK_CALENDAR_DAYS).
     price_cache: dict[str, dict[date, float]] = {}
-    history_start = start - timedelta(days=TRAILING_WINDOW_DAYS + 60)
+    history_start = start - timedelta(days=max(TRAILING_WINDOW_DAYS + 60, MOMENTUM_LOOKBACK_CALENDAR_DAYS))
 
     # Monthly count-bucket cache (Phase A #1/#2): lazily loaded only if we
     # actually reach the live reconstruct_digest() branch below, so offline/
@@ -1359,6 +1543,8 @@ def run_walkforward(
                 "components": entry["components"],
                 "total": entry["total"],
                 "source_signals": entry["source_signals"],
+                "trend_ok": entry.get("trend_ok"),
+                "regime_risk_on": entry.get("regime_risk_on"),
                 "forward": {},
             }
             any_horizon_data = False
@@ -1389,6 +1575,7 @@ def run_walkforward(
     ic_by_component = _build_ic(samples, horizons)
     buckets = _build_buckets(samples, horizons, primary_benchmark)
     option_by_quartile = _build_option_buckets(samples, "90")
+    filtered_buckets = _build_filtered_buckets(samples, primary_benchmark, "90")
     lead_lag = _compute_lead_lag(samples, horizons)
     temporal_ordering = _compute_temporal_ordering(samples, primary_benchmark)
 
@@ -1396,8 +1583,8 @@ def run_walkforward(
         "GitHub star counts are NOT historically reconstructable (the API only "
         "returns the CURRENT star count, with no point-in-time history), so "
         "github_trends is excluded entirely from this walk-forward — the "
-        "as-of score uses only divergence, theme_momentum "
-        "(edgar_fts+arxiv+hn_buzz+jobs), and breadth.",
+        "as-of score uses divergence, theme_momentum "
+        "(edgar_fts+arxiv+hn_buzz+jobs), breadth, and momentum_12_1.",
         "forward_return() snaps both entry and exit strictly backward-only to "
         "the nearest available trading day, and returns None (rather than a "
         "stale estimate) when no close exists within max_snap_days of the "
@@ -1427,6 +1614,15 @@ def run_walkforward(
         "Small universes / short date ranges can produce Information "
         "Coefficients with wide sampling error — treat n_samples and each "
         "bucket's own n as the primary indicator of how much to trust any IC.",
+        "momentum_12_1 (trend.score_momentum_12_1 of trailing daily closes) is "
+        "now a WEIGHTED component (see WALKFORWARD_WEIGHTS); trend_ok "
+        "(price > 50-SMA > 200-SMA) and regime_risk_on (SPY > 200-SMA) are "
+        "stored as per-sample GATE metadata instead — 'filtered_buckets' "
+        "reports the top-quartile underlying+option metrics restricted to "
+        "samples where both gates are True, to measure whether trend/regime "
+        "filtering actually helps rather than assuming it does. None "
+        "(insufficient trailing history for a gate) is treated as 'not "
+        "confirmed passing', not as True.",
     ]
 
     return {
@@ -1446,10 +1642,16 @@ def run_walkforward(
         "ic_by_component": ic_by_component,
         "buckets": buckets,
         "option_by_quartile": option_by_quartile,
+        "filtered_buckets": filtered_buckets,
         "lead_lag": lead_lag,
         "temporal_ordering": temporal_ordering,
         "degraded_buckets": degraded_counter[0],
         "notes": notes,
+        **(
+            {"samples": _compact_samples(samples, horizons)}
+            if include_samples
+            else {}
+        ),
     }
 
 
@@ -1520,11 +1722,15 @@ def _print_report(report: dict[str, Any]) -> None:
         return f"{v:+.3f}" if isinstance(v, (int, float)) else "n/a"
 
     print("Information Coefficient (Spearman) by component and horizon:")
-    print(f"{'horizon':>8} {'n':>5} {'divergence':>11} {'theme_mom':>10} {'breadth':>8} {'total':>8}")
+    print(
+        f"{'horizon':>8} {'n':>5} {'divergence':>11} {'theme_mom':>10} {'breadth':>8} "
+        f"{'mom_12_1':>9} {'total':>8}"
+    )
     for h_key, row in report["ic_by_component"].items():
         print(
             f"{h_key + 'd':>8} {row['n']:>5} {_fmt(row.get('divergence')):>11} "
-            f"{_fmt(row.get('theme_momentum')):>10} {_fmt(row.get('breadth')):>8} {_fmt(row.get('total')):>8}"
+            f"{_fmt(row.get('theme_momentum')):>10} {_fmt(row.get('breadth')):>8} "
+            f"{_fmt(row.get('momentum_12_1')):>9} {_fmt(row.get('total')):>8}"
         )
     print()
 
@@ -1565,6 +1771,20 @@ def _print_report(report: dict[str, Any]) -> None:
         print(f"  Not enough 90d winners to compute ({to.get('n_winners', 0)} winners).")
     print()
 
+    fb = report.get("filtered_buckets") or {}
+    print("Trend+regime gate (Phase B/C) — top-quartile @90d on samples where trend_ok AND regime_risk_on:")
+    fu = fb.get("underlying") or {}
+    fo = fb.get("option") or {}
+
+    def _rate(v: Any) -> str:
+        return f"{v:.1%}" if isinstance(v, (int, float)) else "n/a"
+
+    print(
+        f"  n_gated={fb.get('n_gated', 0)}  underlying: n={fu.get('n', 0)} hit_rate={_rate(fu.get('hit_rate'))}"
+        f"  |  option: n={fo.get('n', 0)} hit_rate={_rate(fo.get('hit_rate'))}"
+    )
+    print()
+
     print("Notes / caveats:")
     for note in report["notes"]:
         print(f"  - {note}")
@@ -1588,7 +1808,8 @@ def _print_summary(report: dict[str, Any]) -> None:
 
     ic90 = (report.get("ic_by_component") or {}).get("90") or {}
     ic_parts = ", ".join(
-        f"{comp}={_fmt_ic(ic90.get(comp))}" for comp in ("divergence", "theme_momentum", "breadth", "total")
+        f"{comp}={_fmt_ic(ic90.get(comp))}"
+        for comp in ("divergence", "theme_momentum", "breadth", "momentum_12_1", "total")
     )
     print(f"IC (Spearman) by component @90d: {ic_parts}")
 
@@ -1631,6 +1852,18 @@ def _print_summary(report: dict[str, Any]) -> None:
         print(f"temporal-ordering: {pct:.1f}%")
     else:
         print("temporal-ordering: n/a")
+
+    fb = report.get("filtered_buckets") or {}
+    fu = fb.get("underlying") or {}
+    fo = fb.get("option") or {}
+    u_hit = fu.get("hit_rate")
+    o_hit = fo.get("hit_rate")
+    u_hit_str = f"{u_hit:.1%}" if isinstance(u_hit, (int, float)) else "n/a"
+    o_hit_str = f"{o_hit:.1%}" if isinstance(o_hit, (int, float)) else "n/a"
+    print(
+        f"trend+regime-filtered top-quartile @90d: hit={u_hit_str} option_hit={o_hit_str} "
+        f"(n={fu.get('n', 0)})"
+    )
 
     notes = report.get("notes") or []
     print(f"notes: {' | '.join(notes) if notes else 'n/a'}")
