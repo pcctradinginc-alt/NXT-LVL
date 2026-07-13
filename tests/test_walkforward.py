@@ -310,3 +310,82 @@ def test_run_walkforward_no_data_returns_empty_but_well_formed():
     assert report["n_samples"] == 0
     assert report["buckets"]["30"]["Q1"]["n"] == 0
     assert report["ic_by_component"]["30"]["total"] is None
+
+
+# ---------------------------------------------------------------------------
+# Phase A: monthly bucketing + cache + option P/L
+# ---------------------------------------------------------------------------
+
+def test_month_range():
+    months = walkforward._month_range(date(2024, 11, 15), date(2025, 2, 3))
+    assert months == ["2024-11", "2024-12", "2025-01", "2025-02"]
+    # Reversed bounds are tolerated (swapped).
+    assert walkforward._month_range(date(2025, 2, 3), date(2024, 11, 15)) == months
+    # Single month.
+    assert walkforward._month_range(date(2025, 5, 2), date(2025, 5, 28)) == ["2025-05"]
+
+
+def test_bucketed_counts_uses_cache():
+    calls = {"n": 0}
+
+    def fake_source(themes, start, end):
+        calls["n"] += 1
+        return {themes[0]["id"]: 7}
+
+    theme = {"id": "ai_inference"}
+    cache: dict[str, int] = {}
+    months = ["2024-11", "2024-12"]  # completed past months
+
+    out1 = walkforward._bucketed_counts(fake_source, cache, "arxiv", theme, months)
+    assert out1 == {"2024-11": 7, "2024-12": 7}
+    assert calls["n"] == 2
+
+    # Same completed months again -> served from cache, no new calls.
+    out2 = walkforward._bucketed_counts(fake_source, cache, "arxiv", theme, months)
+    assert out2 == out1
+    assert calls["n"] == 2
+
+    # The current (incomplete) month is never cached -> re-queried every time.
+    cur = date.today().strftime("%Y-%m")
+    walkforward._bucketed_counts(fake_source, cache, "arxiv", theme, [cur])
+    n1 = calls["n"]
+    walkforward._bucketed_counts(fake_source, cache, "arxiv", theme, [cur])
+    assert calls["n"] == n1 + 1
+
+
+def test_bucketed_counts_degraded_excluded():
+    def none_source(themes, start, end):
+        return {}  # no value for the theme -> degraded, excluded (not a false 0)
+
+    degraded = [0]
+    out = walkforward._bucketed_counts(
+        none_source, {}, "arxiv", {"id": "ai_inference"}, ["2024-11", "2024-12"], degraded=degraded
+    )
+    assert out == {}
+    assert degraded[0] == 2
+
+
+def _synthetic_series(start_price: float, daily_ret: float, n: int) -> dict[str, float]:
+    series: dict[str, float] = {}
+    p = start_price
+    cur = date(2025, 1, 1)
+    for _ in range(n):
+        series[cur.isoformat()] = round(p, 4)
+        p *= (1.0 + daily_ret)
+        cur = cur + timedelta(days=1)
+    return series
+
+
+def test_option_pl_direction():
+    # ~63 days of history before as_of (for realized vol) + >90 days forward.
+    as_of = date(2025, 1, 1) + timedelta(days=70)
+    rising = {"RISE": _synthetic_series(100.0, 0.003, 220)}
+    falling = {"FALL": _synthetic_series(100.0, -0.003, 220)}
+
+    up = walkforward._compute_option_metrics("RISE", as_of, None, rising, (90,))
+    down = walkforward._compute_option_metrics("FALL", as_of, None, falling, (90,))
+
+    assert up.get("90") is not None
+    assert up["90"]["return"] > 0 and up["90"]["hit"] is True
+    assert down.get("90") is not None
+    assert down["90"]["return"] < 0 and down["90"]["hit"] is False

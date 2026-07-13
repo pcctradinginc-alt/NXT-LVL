@@ -25,6 +25,7 @@ permissions:
 jobs:
   backtest:
     runs-on: ubuntu-latest
+    timeout-minutes: 300
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,6 +38,17 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Persist the historical count / price cache across runs. Completed
+      # calendar months are immutable, so a warm cache makes re-runs cheap and
+      # keeps a multi-year backtest well under the timeout.
+      - name: Restore backtest cache
+        uses: actions/cache@v4
+        with:
+          path: data/backtest_cache
+          key: backtest-cache-v1-${{ github.run_id }}
+          restore-keys: |
+            backtest-cache-v1-
 
       - name: Run walk-forward backtest against live Tradier history
         env:
