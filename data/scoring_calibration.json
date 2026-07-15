@@ -3,7 +3,12 @@
     "divergence": 0.0,
     "theme_momentum": 1.0,
     "breadth": 0.0,
-    "momentum_12_1": 0.0
+    "momentum_12_1": 0.0,
+    "reversal_1m": 0.0,
+    "low_vol": 0.0,
+    "high_52w": 0.0,
+    "rs": 0.0,
+    "revenue_growth": 0.0
   },
   "folds": [
     {
@@ -11,20 +16,30 @@
       "n_train": 228,
       "n_val": 228,
       "train_ics": {
-        "divergence": -0.0647,
-        "theme_momentum": -0.0645,
-        "breadth": 0.1043,
-        "momentum_12_1": -0.0948
+        "divergence": -0.0469,
+        "theme_momentum": -0.0593,
+        "breadth": 0.0907,
+        "momentum_12_1": -0.105,
+        "reversal_1m": 0.071,
+        "low_vol": -0.2822,
+        "high_52w": -0.0577,
+        "rs": 0.0108,
+        "revenue_growth": -0.0972
       },
       "weights": {
         "divergence": 0.0,
         "theme_momentum": 0.0,
-        "breadth": 1.0,
-        "momentum_12_1": 0.0
+        "breadth": 0.5258,
+        "momentum_12_1": 0.0,
+        "reversal_1m": 0.4116,
+        "low_vol": 0.0,
+        "high_52w": 0.0,
+        "rs": 0.0626,
+        "revenue_growth": 0.0
       },
-      "val_ic_total": 0.0499,
-      "top_q_option_hit": 0.4211,
-      "bottom_q_option_hit": 0.2456,
+      "val_ic_total": 0.1766,
+      "top_q_option_hit": 0.4737,
+      "bottom_q_option_hit": 0.2982,
       "degenerate_train": false
     },
     {
@@ -32,20 +47,30 @@
       "n_train": 456,
       "n_val": 228,
       "train_ics": {
-        "divergence": -0.1416,
-        "theme_momentum": 0.1716,
-        "breadth": 0.0813,
-        "momentum_12_1": -0.0833
+        "divergence": -0.1047,
+        "theme_momentum": 0.1723,
+        "breadth": 0.0762,
+        "momentum_12_1": -0.0822,
+        "reversal_1m": 0.1547,
+        "low_vol": -0.1773,
+        "high_52w": -0.1754,
+        "rs": -0.2768,
+        "revenue_growth": -0.0888
       },
       "weights": {
         "divergence": 0.0,
-        "theme_momentum": 0.6511,
-        "breadth": 0.3489,
-        "momentum_12_1": 0.0
+        "theme_momentum": 0.4273,
+        "breadth": 0.189,
+        "momentum_12_1": 0.0,
+        "reversal_1m": 0.3837,
+        "low_vol": 0.0,
+        "high_52w": 0.0,
+        "rs": 0.0,
+        "revenue_growth": 0.0
       },
-      "val_ic_total": -0.0595,
-      "top_q_option_hit": 0.5965,
-      "bottom_q_option_hit": 0.7193,
+      "val_ic_total": -0.0505,
+      "top_q_option_hit": 0.614,
+      "bottom_q_option_hit": 0.7368,
       "degenerate_train": false
     },
     {
@@ -53,26 +78,36 @@
       "n_train": 684,
       "n_val": 228,
       "train_ics": {
-        "divergence": -0.1859,
-        "theme_momentum": 0.1527,
-        "breadth": 0.0787,
-        "momentum_12_1": -0.1227
+        "divergence": -0.1628,
+        "theme_momentum": 0.1506,
+        "breadth": 0.0806,
+        "momentum_12_1": -0.127,
+        "reversal_1m": 0.0149,
+        "low_vol": -0.2473,
+        "high_52w": -0.2113,
+        "rs": -0.1316,
+        "revenue_growth": 0.0216
       },
       "weights": {
         "divergence": 0.0,
-        "theme_momentum": 0.6382,
-        "breadth": 0.3618,
-        "momentum_12_1": 0.0
+        "theme_momentum": 0.5626,
+        "breadth": 0.3011,
+        "momentum_12_1": 0.0,
+        "reversal_1m": 0.0557,
+        "low_vol": 0.0,
+        "high_52w": 0.0,
+        "rs": 0.0,
+        "revenue_growth": 0.0807
       },
-      "val_ic_total": -0.21,
-      "top_q_option_hit": 0.3509,
+      "val_ic_total": -0.2832,
+      "top_q_option_hit": 0.2807,
       "bottom_q_option_hit": 0.5614,
       "degenerate_train": false
     }
   ],
   "validation": {
-    "median_val_ic_total": -0.0595,
-    "median_top_q_option_hit": 0.4211,
+    "median_val_ic_total": -0.0505,
+    "median_top_q_option_hit": 0.4737,
     "top_beats_bottom_fraction": 0.3333,
     "passed": false
   },
@@ -84,7 +119,7 @@
     "min_median_top_q_option_hit": 0.55,
     "min_top_beats_bottom_fraction": 0.5
   },
-  "generated_at": "2026-07-14T19:03:49.823384+00:00",
+  "generated_at": "2026-07-15T17:25:17.971627+00:00",
   "notes": [
     "Weights are derived from max(IC, 0) only — a negative or unmeasurable (None) component IC gets ZERO weight and is NEVER inverted, which would fit in-sample noise and fail out-of-sample.",
     "Validation folds are strictly out-of-sample: fold k's weights are trained ONLY on the earlier folds [0..k-1] and never see fold k.",
