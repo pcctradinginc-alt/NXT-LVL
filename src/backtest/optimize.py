@@ -45,6 +45,27 @@ from src.options.tradier import TradierClient
 logger = logging.getLogger(__name__)
 
 CALIBRATION_PATH = DATA_DIR / "scoring_calibration.json"
+# Experiment output (Hebel 1): calibration restricted to the regime-filtered
+# subset (risk-on AND uptrend). Written to a SEPARATE file so it never
+# overwrites the production calibration — adopting it would additionally
+# require production to hard-gate live trades on the SAME trend_ok+regime
+# filter, so it stays an explicit experiment until that consistency is wired.
+FILTERED_CALIBRATION_PATH = DATA_DIR / "scoring_calibration_filtered.json"
+
+
+def regime_filtered_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only samples taken in a confirmed risk-on regime AND uptrend.
+
+    A sample qualifies iff BOTH `regime_risk_on` and `trend_ok` are exactly
+    True (None — insufficient trailing history for the gate — is treated as
+    'not confirmed', i.e. excluded, matching walkforward.filtered_buckets).
+    The hypothesis (CONCEPT_PROFIT.md Hebel 1): factors may only carry edge in
+    the right regime, which mixing all regimes together washes out.
+    """
+    return [
+        s for s in samples
+        if s.get("regime_risk_on") is True and s.get("trend_ok") is True
+    ]
 
 # The reconstructable, weightable score components (same nine
 # walkforward.score_universe_asof now emits — divergence, theme_momentum,
@@ -478,6 +499,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--folds", type=int, default=4, help="Number of time folds (default 4)")
     parser.add_argument("--mock", action="store_true", help="Use deterministic synthetic samples, no network required")
+    parser.add_argument(
+        "--filtered",
+        action="store_true",
+        help=(
+            "Hebel 1 experiment: calibrate ONLY on the regime-filtered subset "
+            "(risk-on AND uptrend). Writes to scoring_calibration_filtered.json, "
+            "never the production file."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -554,16 +584,34 @@ def main(argv: list[str] | None = None) -> int:
     if samples is None:
         return code
 
+    out_path = CALIBRATION_PATH
+    if args.filtered:
+        n_before = len(samples)
+        samples = regime_filtered_samples(samples)
+        out_path = FILTERED_CALIBRATION_PATH
+        print(
+            f"[Hebel 1] regime-filtered calibration: {len(samples)}/{n_before} samples "
+            "kept (regime_risk_on AND trend_ok both True)\n"
+        )
+
     calib = run_calibration(samples, n_folds=args.folds, horizon="90")
+    if args.filtered:
+        calib["filter"] = "regime_risk_on AND trend_ok (both True)"
+        calib.setdefault("notes", []).append(
+            "EXPERIMENT (Hebel 1): calibrated ONLY on risk-on + uptrend samples. "
+            "Adopting a PASSED result here would require production to HARD-GATE "
+            "live trades on the same trend_ok+regime filter (production currently "
+            "hard-gates regime but treats trend_ok as a soft risk flag)."
+        )
 
     _print_report(calib)
     _print_summary(calib)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CALIBRATION_PATH, "w", encoding="utf-8") as fh:
+    with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(calib, fh, indent=2, ensure_ascii=False, default=str)
         fh.write("\n")
-    print(f"\nCalibration written to {CALIBRATION_PATH}")
+    print(f"\nCalibration written to {out_path}")
 
     return 0
 

@@ -275,3 +275,18 @@ def test_run_calibration_report_shape():
             "top_q_option_hit",
             "bottom_q_option_hit",
         }
+
+
+def test_regime_filtered_samples():
+    from src.backtest import optimize as opt
+    samples = [
+        {"ticker": "A", "regime_risk_on": True, "trend_ok": True},    # keep
+        {"ticker": "B", "regime_risk_on": True, "trend_ok": False},   # drop (downtrend)
+        {"ticker": "C", "regime_risk_on": False, "trend_ok": True},   # drop (risk-off)
+        {"ticker": "D", "regime_risk_on": None, "trend_ok": True},    # drop (unconfirmed)
+        {"ticker": "E", "regime_risk_on": True, "trend_ok": None},    # drop (unconfirmed)
+        {"ticker": "F", "regime_risk_on": True, "trend_ok": True},    # keep
+    ]
+    kept = opt.regime_filtered_samples(samples)
+    assert [s["ticker"] for s in kept] == ["A", "F"]
+    assert opt.regime_filtered_samples([]) == []

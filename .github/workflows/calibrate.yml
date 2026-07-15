@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: ""
+      filtered:
+        description: "Hebel 1: calibrate ONLY on the regime-filtered (risk-on + uptrend) subset. Writes scoring_calibration_filtered.json (experiment, NOT committed)."
+        required: false
+        type: boolean
+        default: false
   schedule:
     # Monthly re-calibration: 1st of the month, 12:00 UTC (independent of
     # backtest.yml / scan.yml's own schedules). data/scoring_calibration.json
@@ -82,6 +87,9 @@ jobs:
           if [ -n "${{ inputs.folds }}" ]; then
             ARGS+=(--folds "${{ inputs.folds }}")
           fi
+          if [ "${{ inputs.filtered }}" = "true" ]; then
+            ARGS+=(--filtered)
+          fi
           python -m src.backtest.optimize "${ARGS[@]}"
 
       - name: Commit and push data/scoring_calibration.json if changed
@@ -104,5 +112,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: scoring-calibration
-          path: data/scoring_calibration.json
+          path: data/scoring_calibration*.json
           if-no-files-found: warn

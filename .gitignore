@@ -47,6 +47,7 @@ htmlcov/
 
 # Runtime artifacts (regenerated each run; not the tracked state files)
 data/backtest_cache/
+data/scoring_calibration_filtered.json
 data/last_email.html
 data/last_digest.json
 data/backtest_report.json
