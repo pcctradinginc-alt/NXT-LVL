@@ -290,6 +290,19 @@ def test_run_walkforward_mock_flag_generates_synthetic_digests():
     assert report["params"]["mock"] is True
 
 
+ALL_WEIGHTED_COMPONENTS = (
+    "divergence",
+    "theme_momentum",
+    "breadth",
+    "momentum_12_1",
+    "reversal_1m",
+    "low_vol",
+    "high_52w",
+    "rs",
+    "revenue_growth",
+)
+
+
 def test_walkforward_includes_samples_when_requested():
     """CONCEPT_PROFIT.md Phase C: run_walkforward(..., include_samples=True)
     exposes report["samples"] (compact per-(ticker, as_of) records) so the
@@ -297,6 +310,13 @@ def test_walkforward_includes_samples_when_requested():
     momentum_12_1 component plus the trend_ok/regime_risk_on gate flags. Also
     checks that the report gained ic_by_component["*"]["momentum_12_1"] and a
     filtered_buckets block, and that samples stay OFF by default.
+
+    CONCEPT_PROFIT.md Phase B/C candidate factors: also checks that every
+    sample's components include the five new price/fundamental factors
+    (reversal_1m, low_vol, high_52w, rs, revenue_growth), and that
+    ic_by_component picks them up too — this is what lets
+    src/backtest/optimize.py measure whether any of them carry real
+    out-of-sample edge.
     """
     tickers = ["TA", "TB"]
     benchmarks = ("SPY",)
@@ -327,6 +347,9 @@ def test_walkforward_includes_samples_when_requested():
     assert "filtered_buckets" in report_default
     fb = report_default["filtered_buckets"]
     assert set(("horizon", "n_gated", "underlying", "option")) <= set(fb.keys())
+    # the five new candidate factors are IC-measured too
+    for comp in ("reversal_1m", "low_vol", "high_52w", "rs", "revenue_growth"):
+        assert comp in report_default["ic_by_component"]["90"]
 
     # On when requested.
     report = walkforward.run_walkforward(None, tickers, themes, include_samples=True, **common)
@@ -336,9 +359,11 @@ def test_walkforward_includes_samples_when_requested():
 
     for s in samples:
         assert set(("as_of", "ticker", "components", "trend_ok", "regime_risk_on", "fwd", "opt")) <= set(s.keys())
-        # the four weighted components, including the new momentum factor
-        for comp in ("divergence", "theme_momentum", "breadth", "momentum_12_1"):
+        # all nine weighted components, including the new candidate factors
+        for comp in ALL_WEIGHTED_COMPONENTS:
             assert comp in s["components"]
+            assert isinstance(s["components"][comp], (int, float))
+            assert 0.0 <= s["components"][comp] <= 100.0
         # gate flags are True/False/None (never missing)
         assert s["trend_ok"] in (True, False, None)
         assert s["regime_risk_on"] in (True, False, None)
@@ -348,6 +373,51 @@ def test_walkforward_includes_samples_when_requested():
             assert s["fwd"][h_key] is None or isinstance(s["fwd"][h_key], (int, float))
             assert h_key in s["opt"]
             assert s["opt"][h_key] is None or isinstance(s["opt"][h_key], (int, float))
+
+    # revenue_growth is neutral (50) for every sample here: no tradier was
+    # given (offline/test path), so cik_map stays empty and no SEC network
+    # call is ever attempted (see score_universe_asof's docstring).
+    assert all(s["components"]["revenue_growth"] == 50.0 for s in samples)
+
+
+def test_print_summary_runs_with_new_components(capsys):
+    """CONCEPT_PROFIT.md Phase B/C: _print_summary must run cleanly (no
+    exception, "n/a"-safe) on a report that includes the five new candidate
+    factors, and its output should surface them via a dedicated IC line.
+    """
+    tickers = ["TA", "TB"]
+    benchmarks = ("SPY",)
+    themes = [
+        {"id": "th1", "keywords": ["mockkeyword1"], "tickers": ["TA"]},
+        {"id": "th2", "keywords": ["mockkeyword2"], "tickers": ["TB"]},
+    ]
+    start = date(2023, 1, 2)
+    end = date(2023, 6, 1)
+    price_series = _build_price_series(list(tickers) + list(benchmarks), start, end, seed=5)
+    mock_digests = _build_mock_digests(["th1", "th2"], start, end)
+
+    report = walkforward.run_walkforward(
+        None,
+        tickers,
+        themes,
+        start=start,
+        end=end,
+        cadence_days=30,
+        horizons=(30, 60, 90),
+        benchmarks=benchmarks,
+        price_series=price_series,
+        mock_digests=mock_digests,
+    )
+
+    walkforward._print_report(report)
+    walkforward._print_summary(report)
+    out = capsys.readouterr().out
+
+    assert "=== WALK-FORWARD SUMMARY ===" in out
+    assert "=== END SUMMARY ===" in out
+    assert "IC (Spearman) by candidate factor @90d:" in out
+    for comp in ("reversal_1m", "low_vol", "high_52w", "rs", "revenue_growth"):
+        assert comp in out
 
 
 def test_run_walkforward_no_data_returns_empty_but_well_formed():

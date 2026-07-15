@@ -16,6 +16,9 @@ ranges, see the `_hist_*` helpers below) and which are not:
   - SEC EDGAR full-text search (startdt/enddt)            RECONSTRUCTABLE
   - HN "Who is hiring" keyword mentions (Algolia range)   RECONSTRUCTABLE
   - Underlying price history (Tradier daily history)      RECONSTRUCTABLE
+  - SEC EDGAR XBRL company-concept revenue facts           RECONSTRUCTABLE
+    (companyconcept endpoint, gated on each fact's `filed` date <= as_of —
+    see `_revenue_yoy_asof`)
   - GitHub stars                                          NOT RECONSTRUCTABLE
     (the GitHub API only ever returns the CURRENT star count; there is no
     historical star-count endpoint, so github_trends is entirely excluded
@@ -29,8 +32,8 @@ parallel). It reuses read-only patterns from price_backtest.py (trading-day
 snapping helpers) and calibrate.py (Spearman rank correlation) instead of
 duplicating that logic.
 
-Simplified as-of scoring (score_universe_asof) uses only three components,
-weighted as documented in WALKFORWARD_WEIGHTS:
+Simplified as-of scoring (score_universe_asof) weights nine components, as
+documented in WALKFORWARD_WEIGHTS:
   - divergence:     scoring.score_divergence() of the trailing 3-month price
                      move ending at as_of (same bucket logic as production).
   - theme_momentum: growth of the ticker's mapped theme(s) source-count sum
@@ -38,6 +41,12 @@ weighted as documented in WALKFORWARD_WEIGHTS:
                      baseline window — a lightweight momentum proxy.
   - breadth:        how many of the 4 reconstructable sources show non-zero
                      signal for the ticker's theme(s) in the current window.
+  - momentum_12_1:  src.analysis.trend's 12-1 price momentum.
+  - reversal_1m, low_vol, high_52w, rs: cross-sectional price factors from
+                     src.analysis.factors (all reconstructable exactly from
+                     the same trailing Tradier closes already fetched).
+  - revenue_growth: fundamental YoY revenue growth from SEC EDGAR XBRL, see
+                     `_revenue_yoy_asof` below.
 
 Proposal cross-references:
   #2  walk-forward / point-in-time reconstruction — this module.
@@ -63,7 +72,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from src.analysis import scoring, trend
+from src.analysis import factors, scoring, trend
 from src.analysis.options_math import bs_call_price, solve_strike_for_delta
 from src.backtest.calibrate import spearman
 from src.backtest.price_backtest import (
@@ -73,6 +82,7 @@ from src.backtest.price_backtest import (
     _parse_date,
     _realized_vol,
 )
+from src.collectors import edgar_capex
 from src.config import DATA_DIR, load_settings
 from src.http_utils import get_json, get_text
 from src.options.tradier import TradierClient
@@ -136,19 +146,40 @@ OPTION_SPREAD_PCT = 0.06
 # CONCEPT_PROFIT.md Phase B/C: the first real walk-forward run (2026-07-12,
 # n=96) measured breadth at IC=-0.305 and divergence at IC=-0.169 @90d (both
 # anti-predictive on that sample), theme_momentum at IC=+0.051 (the only
-# positive candidate), and had no price-momentum factor at all. These
-# defaults react to that finding — momentum_12_1 (the best-documented free
-# momentum factor, Phase B #1) gets the largest weight, theme_momentum keeps
-# its prior (only-positive-so-far) weight, and divergence/breadth are cut
-# back since neither has earned default trust. These are still just a
-# starting point, not a claim of edge: `src/backtest/optimize.py` (Phase C)
-# recalibrates weights from measured out-of-sample IC, and *that* calibration
-# is what should actually gate production scoring, not these defaults.
+# positive candidate), and had no price-momentum factor at all. A later run
+# found the buzz/theme composite showed no edge overall (calibration
+# passed=False, IC(total)=-0.06) — the honest response is not to keep
+# building on plausibility, but to add the highest-evidence FREE candidate
+# factors (src/analysis/factors.py: reversal_1m, low_vol, high_52w, rs — all
+# academically well-documented cross-sectional price effects reconstructable
+# exactly from the Tradier daily history already cached — plus
+# revenue_growth from SEC EDGAR XBRL) and let src/backtest/optimize.py's fold
+# calibration MEASURE whether any of them carry real out-of-sample edge,
+# rather than assuming they do.
+#
+# These weights are a documented STARTING POINT for the unweighted `total`
+# display only, chosen (not derived) so that: momentum_12_1 (the
+# best-documented free momentum factor) and the new reversal/low-vol
+# factors get meaningful weight; theme_momentum keeps its prior
+# (only-positive-so-far) weight; divergence/breadth are cut back since
+# neither has earned default trust; rs is weighted lightly since it is a
+# close cousin of momentum_12_1 (redundant signal, avoid double-counting);
+# revenue_growth is weighted lightly since it is fundamentals-only, updates
+# at quarterly (not daily) granularity, and is a single company-level
+# signal. Chosen to sum to 1.0 by construction — no runtime renormalization
+# needed. `src/backtest/optimize.py` (Phase C) is what actually recalibrates
+# weights from measured out-of-sample IC; that calibration, not these
+# defaults, is what should gate production scoring.
 WALKFORWARD_WEIGHTS = {
-    "divergence": 0.20,
-    "theme_momentum": 0.30,
-    "breadth": 0.10,
-    "momentum_12_1": 0.40,
+    "divergence": 0.10,
+    "theme_momentum": 0.15,
+    "breadth": 0.05,
+    "momentum_12_1": 0.20,
+    "reversal_1m": 0.15,
+    "low_vol": 0.15,
+    "high_52w": 0.10,
+    "rs": 0.05,
+    "revenue_growth": 0.05,
 }
 
 HEADER_LINE = (
@@ -683,6 +714,233 @@ def reconstruct_digest(
 
 
 # ---------------------------------------------------------------------------
+# EDGAR revenue (Phase B/C candidate factor): SEC XBRL companyconcept quarterly
+# revenue facts, historically reconstructable because every fact carries a
+# `filed` date — filtering to facts with filed <= as_of gives an honest
+# point-in-time view with NO look-ahead, the same discipline forward_return()
+# applies to prices. Cached on disk per ticker (the full concept series,
+# fetched once) so a multi-year/many-as-of-date run makes ONE SEC request per
+# ticker instead of one per (ticker, as_of).
+# ---------------------------------------------------------------------------
+
+# Concepts tried in order per ticker; RevenueFromContractWithCustomerExcluding
+# AssessedTax is the modern ASC 606 top-line revenue tag most large filers
+# have used since ~2018, Revenues is the older/fallback tag for filers who
+# never migrated or who predate ASC 606 in the queried history.
+REVENUE_CONCEPTS: tuple[str, ...] = (
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
+)
+
+# A fact is treated as a genuine discrete quarter (not a YTD-cumulative or
+# full-year figure) when its own [start, end] span is at most this many days.
+# Unlike edgar_capex.py's capex handling, YTD-cumulative facts are simply
+# DROPPED here rather than reconstructed via differencing (a documented
+# simplification — see _fetch_revenue_quarters' docstring).
+REVENUE_MAX_QUARTER_SPAN_DAYS = 100
+
+# How many days apart an "end" date may be from (latest_end - 365) to still
+# count as "the same quarter one year earlier" for the YoY match.
+REVENUE_YOY_MATCH_TOLERANCE_DAYS = 45
+
+# SEC pacing: same lightweight per-request pause src/collectors/edgar_fts.py's
+# _hist_edgar_fts (this module) already uses — at most 2 requests per ticker
+# (REVENUE_CONCEPTS), and disk-cached afterward, so this is not a hot path.
+REVENUE_REQUEST_PAUSE_SECONDS = 0.2
+
+
+def _revenue_cache_path(ticker: str) -> Path:
+    return CACHE_DIR / f"revenue_{_safe_ticker_filename(ticker)}.json"
+
+
+def _load_disk_revenue_cache(ticker: str, path: Path | None = None) -> list[dict[str, Any]] | None:
+    """Load the cached raw quarterly revenue-fact list for `ticker`, or None
+    if there is no cache file yet (a genuinely un-cached ticker) or it is
+    unreadable/corrupt (treated the same as "not cached yet" — a fresh fetch
+    will overwrite it)."""
+    cache_path = path or _revenue_cache_path(ticker)
+    try:
+        with open(cache_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return data
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("walkforward: revenue cache unreadable for %s (%s): %s", ticker, cache_path, exc)
+        return None
+    return None
+
+
+def _save_disk_revenue_cache(ticker: str, series: list[dict[str, Any]], path: Path | None = None) -> None:
+    cache_path = path or _revenue_cache_path(ticker)
+    try:
+        _atomic_write_json(cache_path, series)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("walkforward: failed to save revenue cache for %s (%s): %s", ticker, cache_path, exc)
+
+
+def _fetch_revenue_quarters(ticker: str, cik_map: dict[str, int]) -> list[dict[str, Any]]:
+    """One-shot SEC EDGAR XBRL companyconcept fetch of `ticker`'s discrete
+    quarterly revenue facts (raw, not yet as-of-filtered — see
+    `_revenue_yoy_asof` for the filed-date gating and YoY matching that
+    consumes this).
+
+    Tries each concept in REVENUE_CONCEPTS in order, using the first one that
+    returns any usable discrete-quarter facts — same "try concepts in order"
+    pattern as src/collectors/edgar_capex.py's CONCEPT_CANDIDATES, but
+    simpler: unlike capex (which reconstructs discrete quarters from
+    YTD-cumulative facts via differencing), here a fact is kept ONLY when its
+    own [start, end] span is already a genuine discrete quarter (form 10-Q or
+    10-K, span <= REVENUE_MAX_QUARTER_SPAN_DAYS) — YTD-cumulative and
+    full-year facts are dropped outright. This is a documented
+    simplification: it under-counts revenue history for filers who only tag
+    YTD-cumulative revenue (losing some of their Q2-Q4 data-points), but
+    avoids re-implementing capex's differencing logic for a second concept;
+    most large filers do also tag discrete quarterly revenue.
+
+    Returns [] (never None, never raises) on any failure or when no CIK is
+    known for `ticker` — `_revenue_yoy_asof` treats [] as "no revenue signal
+    available", the same as it treats a lookup miss.
+    """
+    cik = cik_map.get(ticker.upper())
+    if cik is None:
+        return []
+
+    for concept in REVENUE_CONCEPTS:
+        url = f"https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/us-gaap/{concept}.json"
+        try:
+            payload = get_json(url)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("walkforward: revenue concept %s unavailable for %s: %s", concept, ticker, exc)
+            time.sleep(REVENUE_REQUEST_PAUSE_SECONDS)
+            continue
+        time.sleep(REVENUE_REQUEST_PAUSE_SECONDS)
+
+        facts = payload.get("units", {}).get("USD", []) if isinstance(payload, dict) else []
+        quarters: list[dict[str, Any]] = []
+        for fact in facts:
+            end_s, start_s = fact.get("end"), fact.get("start")
+            filed_s, form = fact.get("filed"), fact.get("form")
+            val = fact.get("val")
+            if not end_s or not start_s or not filed_s or val is None or form not in ("10-Q", "10-K"):
+                continue
+            end_d = _parse_date(str(end_s))
+            start_d = _parse_date(str(start_s))
+            if end_d is None or start_d is None:
+                continue
+            span = (end_d - start_d).days
+            if span <= 0 or span > REVENUE_MAX_QUARTER_SPAN_DAYS:
+                continue  # YTD-cumulative or annual fact, not a discrete quarter
+            quarters.append({"end": end_s, "start": start_s, "val": val, "form": form, "filed": filed_s})
+
+        if quarters:
+            return quarters
+
+    return []
+
+
+def _revenue_yoy_asof(
+    ticker: str,
+    as_of_date: date,
+    cik_map: dict[str, int],
+    cache: dict[str, list[dict[str, Any]]],
+) -> float | None:
+    """YoY revenue growth (%) for `ticker` as of `as_of_date`, with NO look-ahead.
+
+    `cache` (mutated in place) maps ticker -> the full raw quarterly-fact list
+    from `_fetch_revenue_quarters`, populated at most once per ticker per
+    process: an in-memory hit skips even the disk read; a disk-cache hit (see
+    `_load_disk_revenue_cache`) skips the network fetch; only a genuine miss
+    on both hits SEC (and is then saved to disk for next time).
+
+    No CIK known for `ticker` in `cik_map` — including the whole offline/
+    mock/test path, where `cik_map` is deliberately left empty (see
+    score_universe_asof/run_walkforward) so this never touches the network —
+    short-circuits to None WITHOUT any disk I/O either, mirroring
+    `_price_map_for`'s "no tradier -> {}, don't touch the cache" rule for
+    prices: an offline run should be a pure in-memory computation, not one
+    that quietly writes empty cache files to data/backtest_cache/ for every
+    ticker it can't resolve.
+
+    Point-in-time discipline: only facts whose `filed` date is <= as_of_date
+    are eligible — a quarter's revenue is not "known" until the filing that
+    reports it is actually filed, mirroring forward_return()'s no-look-ahead
+    rule for prices. Among eligible facts, the most recent by `end` date is
+    "latest"; its YoY comparison quarter is whichever OTHER eligible fact's
+    `end` date is closest to (latest's end - 365 days), accepted only within
+    REVENUE_YOY_MATCH_TOLERANCE_DAYS (~45 days) — loosely matching the same
+    fiscal quarter one year earlier without requiring exact calendar
+    alignment (fiscal quarter-ends drift by a few days year to year).
+
+    Returns None (never raises) when: the ticker has no known CIK, no
+    quarterly revenue data was fetchable, no fact is eligible as-of this
+    date, no comparison quarter is found within tolerance, or the prior
+    quarter's value is zero (growth % undefined).
+    """
+    ticker_u = ticker.upper()
+    if ticker_u in cache:
+        series = cache[ticker_u]
+    elif cik_map.get(ticker_u) is None:
+        # No known CIK -- either a genuinely unresolvable ticker, or the
+        # whole run is offline/mock (cik_map is {}). Either way: no disk, no
+        # network, just remember the empty result for this run.
+        series = []
+        cache[ticker_u] = series
+    else:
+        series = _load_disk_revenue_cache(ticker_u)
+        if series is None:
+            try:
+                series = _fetch_revenue_quarters(ticker_u, cik_map)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("walkforward: revenue fetch failed for %s: %s", ticker_u, exc)
+                series = []
+            _save_disk_revenue_cache(ticker_u, series)
+        cache[ticker_u] = series
+
+    if not series:
+        return None
+
+    as_of_str = as_of_date.isoformat()
+    eligible = [
+        f
+        for f in series
+        if isinstance(f, dict) and f.get("filed") and f.get("val") is not None and str(f["filed"]) <= as_of_str
+    ]
+    if not eligible:
+        return None
+
+    eligible.sort(key=lambda f: str(f.get("end", "")))
+    latest = eligible[-1]
+    latest_end = _parse_date(str(latest.get("end", "")))
+    if latest_end is None:
+        return None
+
+    target_prior_end = latest_end - timedelta(days=365)
+    best: dict[str, Any] | None = None
+    best_diff: int | None = None
+    for f in eligible[:-1]:
+        f_end = _parse_date(str(f.get("end", "")))
+        if f_end is None:
+            continue
+        diff = abs((f_end - target_prior_end).days)
+        if diff <= REVENUE_YOY_MATCH_TOLERANCE_DAYS and (best_diff is None or diff < best_diff):
+            best, best_diff = f, diff
+
+    if best is None:
+        return None
+    try:
+        latest_val = float(latest["val"])
+        prior_val = float(best["val"])
+    except (TypeError, ValueError):
+        return None
+    if prior_val == 0:
+        return None
+
+    return round((latest_val - prior_val) / abs(prior_val) * 100.0, 2)
+
+
+# ---------------------------------------------------------------------------
 # As-of scoring
 # ---------------------------------------------------------------------------
 
@@ -909,6 +1167,8 @@ def score_universe_asof(
     price_cache: dict[str, dict[date, float]] | None = None,
     history_start: date | None = None,
     benchmark: str = REGIME_BENCHMARK,
+    cik_map: dict[str, int] | None = None,
+    revenue_cache: dict[str, list[dict[str, Any]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Simplified as-of score for each ticker, from reconstructable components only.
 
@@ -932,9 +1192,26 @@ def score_universe_asof(
         history (see src.analysis.trend) to evaluate it — None is a distinct,
         honest "unknown", not coerced to True or False.
 
+    CONCEPT_PROFIT.md Phase B/C candidate factors add five more WEIGHTED
+    components (src.analysis.factors, all reconstructable and fault-tolerant
+    — see WALKFORWARD_WEIGHTS):
+      - reversal_1m, low_vol, high_52w: computed from the SAME `trailing_closes`
+        already fetched for momentum_12_1/divergence — no extra price fetch.
+      - rs: computed from `trailing_closes` vs. the SAME `benchmark_closes`
+        already fetched once (below) for the regime gate — no extra fetch.
+      - revenue_growth: `_revenue_yoy_asof()` of `ticker`, via `cik_map` (SEC
+        ticker->CIK map) and `revenue_cache` (per-ticker raw revenue-fact
+        cache, mutated in place). When `cik_map` is not given, it is only
+        built (a real network call) when `tradier` is not None — i.e. only
+        in genuine live-price mode; offline/test/mock runs (tradier=None)
+        never touch the network for revenue and revenue_growth degrades to
+        neutral (50) for every ticker, matching how price factors already
+        degrade to neutral without a `tradier`/`price_series`.
+
     Returns a list of
       {"ticker", "as_of",
-       "components": {"divergence", "theme_momentum", "breadth", "momentum_12_1"},
+       "components": {"divergence", "theme_momentum", "breadth", "momentum_12_1",
+                       "reversal_1m", "low_vol", "high_52w", "rs", "revenue_growth"},
        "total", "source_signals": {source: raw_current_count},
        "trend_ok": bool | None, "regime_risk_on": bool | None}
     (the extra "source_signals" field feeds the lead-lag analysis in
@@ -943,9 +1220,15 @@ def score_universe_asof(
     themes = themes or []
     ticker_theme_map = _ticker_theme_ids(tickers, themes)
 
+    if cik_map is None:
+        cik_map = edgar_capex.build_ticker_to_cik_map() if tradier is not None else {}
+    if revenue_cache is None:
+        revenue_cache = {}
+
     # Regime gate is a function of (benchmark, as_of_date) only — the same
     # for every ticker at this as_of date — so it's computed once here
-    # rather than once per ticker.
+    # rather than once per ticker. rs_score reuses these same closes (the
+    # benchmark defaults to SPY, REGIME_BENCHMARK) instead of a second fetch.
     benchmark_closes = _trailing_closes_asof(
         benchmark, as_of_date, tradier, price_series, price_cache=price_cache, history_start=history_start
     )
@@ -961,6 +1244,12 @@ def score_universe_asof(
         )
         divergence = scoring.score_divergence(perf_3m)
         momentum_12_1 = trend.score_momentum_12_1(trailing_closes)
+        reversal_1m = factors.reversal_1m_score(trailing_closes)
+        low_vol = factors.low_vol_score(trailing_closes)
+        high_52w = factors.high_52w_score(trailing_closes)
+        rs = factors.rs_score(trailing_closes, benchmark_closes)
+        revenue_yoy = _revenue_yoy_asof(ticker, as_of_date, cik_map, revenue_cache)
+        revenue_growth = factors.revenue_growth_score(revenue_yoy)
 
         theme_ids = ticker_theme_map.get(ticker, [])
         signal = _theme_signal(theme_ids, digest)
@@ -972,6 +1261,11 @@ def score_universe_asof(
             + theme_momentum * WALKFORWARD_WEIGHTS["theme_momentum"]
             + breadth * WALKFORWARD_WEIGHTS["breadth"]
             + momentum_12_1 * WALKFORWARD_WEIGHTS["momentum_12_1"]
+            + reversal_1m * WALKFORWARD_WEIGHTS["reversal_1m"]
+            + low_vol * WALKFORWARD_WEIGHTS["low_vol"]
+            + high_52w * WALKFORWARD_WEIGHTS["high_52w"]
+            + rs * WALKFORWARD_WEIGHTS["rs"]
+            + revenue_growth * WALKFORWARD_WEIGHTS["revenue_growth"]
         )
 
         results.append(
@@ -983,6 +1277,11 @@ def score_universe_asof(
                     "theme_momentum": round(theme_momentum, 2),
                     "breadth": round(breadth, 2),
                     "momentum_12_1": round(momentum_12_1, 2),
+                    "reversal_1m": round(reversal_1m, 2),
+                    "low_vol": round(low_vol, 2),
+                    "high_52w": round(high_52w, 2),
+                    "rs": round(rs, 2),
+                    "revenue_growth": round(revenue_growth, 2),
                 },
                 "total": round(total, 2),
                 "source_signals": dict(signal["current"]),
@@ -1259,7 +1558,18 @@ def _aggregate_bucket(items: list[dict[str, Any]], horizon_key: str, primary_ben
 
 
 def _build_ic(samples: list[dict[str, Any]], horizons: tuple[int, ...]) -> dict[str, Any]:
-    components = ("divergence", "theme_momentum", "breadth", "momentum_12_1", "total")
+    components = (
+        "divergence",
+        "theme_momentum",
+        "breadth",
+        "momentum_12_1",
+        "reversal_1m",
+        "low_vol",
+        "high_52w",
+        "rs",
+        "revenue_growth",
+        "total",
+    )
     out: dict[str, Any] = {}
     for h in horizons:
         h_key = str(h)
@@ -1390,7 +1700,8 @@ def _compact_samples(samples: list[dict[str, Any]], horizons: tuple[int, ...]) -
     data:
 
       {"as_of", "ticker", "components": {divergence, theme_momentum, breadth,
-       momentum_12_1}, "trend_ok", "regime_risk_on",
+       momentum_12_1, reversal_1m, low_vol, high_52w, rs, revenue_growth},
+       "trend_ok", "regime_risk_on",
        "fwd": {horizon_str: pct_return | None},
        "opt": {horizon_str: option_pct_return | None}}
 
@@ -1469,7 +1780,8 @@ def run_walkforward(
     already cover a given date (offline/test paths never hit disk).
 
     Returns a report dict with `params`, `n_samples`, `ic_by_component` (per
-    horizon, now including momentum_12_1 — CONCEPT_PROFIT.md Phase B),
+    horizon, now including momentum_12_1 and the reversal_1m/low_vol/
+    high_52w/rs/revenue_growth candidate factors — CONCEPT_PROFIT.md Phase B/C),
     `buckets` (hit-rate & avg alpha by total-score quartile, per horizon),
     `option_by_quartile` (synthetic 120-DTE delta-0.60 call hit-rate & avg
     return by quartile @90d — see `_compute_option_metrics`),
@@ -1509,6 +1821,17 @@ def run_walkforward(
     counts_cache: dict[str, int] | None = None
     degraded_counter = [0]
 
+    # Revenue (EDGAR XBRL, Phase B/C candidate factor) memoization, built once
+    # for the whole run rather than once per as-of date. `cik_map` is only
+    # populated via a real network call in genuine live-price mode (tradier
+    # given, no injected price_series) — offline/mock/test runs keep it empty
+    # so revenue_growth degrades to neutral without ever touching the network
+    # or disk (see score_universe_asof's docstring).
+    cik_map: dict[str, int] = {}
+    if tradier is not None and price_series is None:
+        cik_map = edgar_capex.build_ticker_to_cik_map()
+    revenue_cache: dict[str, list[dict[str, Any]]] = {}
+
     samples: list[dict[str, Any]] = []
 
     for as_of in as_of_grid:
@@ -1533,6 +1856,8 @@ def run_walkforward(
             price_series=price_series,
             price_cache=price_cache,
             history_start=history_start,
+            cik_map=cik_map,
+            revenue_cache=revenue_cache,
         )
 
         for entry in scored:
@@ -1584,7 +1909,9 @@ def run_walkforward(
         "returns the CURRENT star count, with no point-in-time history), so "
         "github_trends is excluded entirely from this walk-forward — the "
         "as-of score uses divergence, theme_momentum "
-        "(edgar_fts+arxiv+hn_buzz+jobs), breadth, and momentum_12_1.",
+        "(edgar_fts+arxiv+hn_buzz+jobs), breadth, momentum_12_1, and the "
+        "candidate factors reversal_1m/low_vol/high_52w/rs/revenue_growth "
+        "(see src.analysis.factors and _revenue_yoy_asof).",
         "forward_return() snaps both entry and exit strictly backward-only to "
         "the nearest available trading day, and returns None (rather than a "
         "stale estimate) when no close exists within max_snap_days of the "
@@ -1623,6 +1950,16 @@ def run_walkforward(
         "filtering actually helps rather than assuming it does. None "
         "(insufficient trailing history for a gate) is treated as 'not "
         "confirmed passing', not as True.",
+        "reversal_1m/low_vol/high_52w/rs (src.analysis.factors) are computed "
+        "from the SAME trailing closes already fetched for momentum_12_1 — no "
+        "extra Tradier calls. revenue_growth (_revenue_yoy_asof) is gated on "
+        "each SEC XBRL fact's `filed` date <= as_of (no look-ahead) and is "
+        "cached on disk per ticker (data/backtest_cache/revenue_<TICKER>.json) "
+        "after one fetch per ticker for the whole run; it only ever touches "
+        "the network in genuine live-price mode (tradier given, no injected "
+        "price_series) and degrades to neutral (50) otherwise. These are all "
+        "measured, not assumed, edges — src/backtest/optimize.py's fold "
+        "calibration is what decides whether any of them earn real weight.",
     ]
 
     return {
@@ -1734,6 +2071,19 @@ def _print_report(report: dict[str, Any]) -> None:
         )
     print()
 
+    print("Information Coefficient (Spearman) — candidate price/fundamental factors:")
+    print(
+        f"{'horizon':>8} {'n':>5} {'reversal_1m':>12} {'low_vol':>8} {'high_52w':>9} "
+        f"{'rs':>7} {'rev_growth':>11}"
+    )
+    for h_key, row in report["ic_by_component"].items():
+        print(
+            f"{h_key + 'd':>8} {row['n']:>5} {_fmt(row.get('reversal_1m')):>12} "
+            f"{_fmt(row.get('low_vol')):>8} {_fmt(row.get('high_52w')):>9} "
+            f"{_fmt(row.get('rs')):>7} {_fmt(row.get('revenue_growth')):>11}"
+        )
+    print()
+
     print("Hit-rate & avg forward alpha by total-score quartile:")
     for h_key, buckets in report["buckets"].items():
         print(f"  horizon={h_key}d")
@@ -1812,6 +2162,12 @@ def _print_summary(report: dict[str, Any]) -> None:
         for comp in ("divergence", "theme_momentum", "breadth", "momentum_12_1", "total")
     )
     print(f"IC (Spearman) by component @90d: {ic_parts}")
+
+    ic_parts_candidates = ", ".join(
+        f"{comp}={_fmt_ic(ic90.get(comp))}"
+        for comp in ("reversal_1m", "low_vol", "high_52w", "rs", "revenue_growth")
+    )
+    print(f"IC (Spearman) by candidate factor @90d: {ic_parts_candidates}")
 
     buckets90 = (report.get("buckets") or {}).get("90") or {}
     hit_parts = []

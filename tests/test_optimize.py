@@ -180,6 +180,45 @@ def test_run_calibration_passes_on_edge():
     assert wf["divergence"] == 0.0
 
 
+def test_run_calibration_generalizes_to_expanded_components():
+    """CONCEPT_PROFIT.md Phase B/C: run_calibration must work over the
+    EXPANDED COMPONENTS set (9, not just the original 4) — a new candidate
+    factor (low_vol) that genuinely predicts forward returns should earn
+    weight and validate out-of-sample, while a same-shaped but genuinely
+    RANDOM new candidate factor (high_52w) should end up with ~0 final
+    weight — proving derive_weights' max(IC, 0)-only rule (never invert a
+    negative IC) generalizes to the new factors, not just the original four.
+    """
+    base = date(2024, 1, 1)
+    rng = random.Random(99)
+    samples = []
+    for j in range(40):
+        lv = (j % 10) * 10.0  # 0,10,...,90 — a full spread inside each fold of 10
+        noise = rng.uniform(0, 100)  # unrelated to forward return
+        samples.append(
+            _mk_sample(
+                (base + timedelta(days=j)).isoformat(),
+                "T",
+                {"low_vol": lv, "high_52w": noise},
+                fwd90=lv,  # forward return rank-tracks low_vol -> IC +1
+                opt90=0.5 if lv >= 50 else -0.5,
+            )
+        )
+
+    calib = optimize.run_calibration(samples, n_folds=4, horizon="90")
+
+    assert calib["validation"]["passed"] is True
+    assert calib["validation"]["median_val_ic_total"] > 0.0
+
+    wf = calib["weights_final"]
+    assert wf["low_vol"] == max(wf.values())
+    assert wf["low_vol"] > 0.9
+    assert wf["high_52w"] == 0.0  # negative full-sample IC -> zero weight, never inverted
+    # the untouched original components stay at their honest "unmeasurable" state
+    assert wf["divergence"] == 0.0
+    assert wf["momentum_12_1"] == 0.0
+
+
 def test_run_calibration_fails_on_noise():
     """Random, no-signal samples must NOT pass (honest 'no edge found')."""
     rng = random.Random(42)

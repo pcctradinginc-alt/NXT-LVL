@@ -46,11 +46,25 @@ logger = logging.getLogger(__name__)
 
 CALIBRATION_PATH = DATA_DIR / "scoring_calibration.json"
 
-# The reconstructable, weightable score components (same four
+# The reconstructable, weightable score components (same nine
 # walkforward.score_universe_asof now emits — divergence, theme_momentum,
-# breadth, momentum_12_1). trend_ok / regime_risk_on are GATES, not weighted
-# components, so they are intentionally NOT in this list.
-COMPONENTS: tuple[str, ...] = ("divergence", "theme_momentum", "breadth", "momentum_12_1")
+# breadth, momentum_12_1, plus the CONCEPT_PROFIT.md Phase B/C candidate
+# factors reversal_1m/low_vol/high_52w/rs (src.analysis.factors, pure
+# cross-sectional price factors reconstructable from cached Tradier daily
+# history) and revenue_growth (SEC EDGAR XBRL, see
+# walkforward._revenue_yoy_asof)). trend_ok / regime_risk_on are GATES, not
+# weighted components, so they are intentionally NOT in this list.
+COMPONENTS: tuple[str, ...] = (
+    "divergence",
+    "theme_momentum",
+    "breadth",
+    "momentum_12_1",
+    "reversal_1m",
+    "low_vol",
+    "high_52w",
+    "rs",
+    "revenue_growth",
+)
 
 NEUTRAL_SCORE = 50.0
 
