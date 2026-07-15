@@ -93,6 +93,9 @@ jobs:
           python -m src.backtest.optimize "${ARGS[@]}"
 
       - name: Commit and push data/scoring_calibration.json if changed
+        # The --filtered experiment writes a separate, git-ignored file and must
+        # never commit the production calibration.
+        if: ${{ inputs.filtered != true }}
         run: |
           git config user.name "nxt-lvl-bot"
           git config user.email "actions@users.noreply.github.com"
