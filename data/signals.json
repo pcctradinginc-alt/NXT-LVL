@@ -71,6 +71,11 @@
         "date": "2026-07-21",
         "option_mid": null,
         "dte": null
+      },
+      {
+        "date": "2026-07-22",
+        "option_mid": null,
+        "dte": null
       }
     ],
     "result": null,
@@ -153,6 +158,11 @@
         "date": "2026-07-21",
         "option_mid": 30.9,
         "dte": 122
+      },
+      {
+        "date": "2026-07-22",
+        "option_mid": 35.075,
+        "dte": 121
       }
     ],
     "result": null,
