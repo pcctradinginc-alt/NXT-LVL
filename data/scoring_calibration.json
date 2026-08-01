@@ -1,0 +1,129 @@
+{
+  "weights_final": {
+    "divergence": 0.0,
+    "theme_momentum": 0.1703,
+    "breadth": 0.0,
+    "momentum_12_1": 0.2175,
+    "reversal_1m": 0.6122,
+    "low_vol": 0.0,
+    "high_52w": 0.0,
+    "rs": 0.0,
+    "revenue_growth": 0.0
+  },
+  "folds": [
+    {
+      "fold_index": 1,
+      "n_train": 435,
+      "n_val": 435,
+      "train_ics": {
+        "divergence": 0.0476,
+        "theme_momentum": -0.0093,
+        "breadth": -0.0653,
+        "momentum_12_1": 0.1021,
+        "reversal_1m": 0.2951,
+        "low_vol": -0.0348,
+        "high_52w": -0.0834,
+        "rs": -0.1815,
+        "revenue_growth": 0.1219
+      },
+      "weights": {
+        "divergence": 0.084,
+        "theme_momentum": 0.0,
+        "breadth": 0.0,
+        "momentum_12_1": 0.1802,
+        "reversal_1m": 0.5207,
+        "low_vol": 0.0,
+        "high_52w": 0.0,
+        "rs": 0.0,
+        "revenue_growth": 0.2151
+      },
+      "val_ic_total": -0.0536,
+      "top_q_option_hit": 0.4486,
+      "bottom_q_option_hit": 0.486,
+      "degenerate_train": false
+    },
+    {
+      "fold_index": 2,
+      "n_train": 870,
+      "n_val": 435,
+      "train_ics": {
+        "divergence": 0.098,
+        "theme_momentum": -0.0617,
+        "breadth": -0.1057,
+        "momentum_12_1": 0.08,
+        "reversal_1m": 0.115,
+        "low_vol": 0.0631,
+        "high_52w": 0.0224,
+        "rs": -0.0861,
+        "revenue_growth": -0.0206
+      },
+      "weights": {
+        "divergence": 0.2589,
+        "theme_momentum": 0.0,
+        "breadth": 0.0,
+        "momentum_12_1": 0.2114,
+        "reversal_1m": 0.3038,
+        "low_vol": 0.1667,
+        "high_52w": 0.0592,
+        "rs": 0.0,
+        "revenue_growth": 0.0
+      },
+      "val_ic_total": -0.0899,
+      "top_q_option_hit": 0.3761,
+      "bottom_q_option_hit": 0.4444,
+      "degenerate_train": false
+    },
+    {
+      "fold_index": 3,
+      "n_train": 1305,
+      "n_val": 435,
+      "train_ics": {
+        "divergence": 0.0065,
+        "theme_momentum": 0.0315,
+        "breadth": -0.0418,
+        "momentum_12_1": 0.0227,
+        "reversal_1m": 0.1443,
+        "low_vol": -0.0289,
+        "high_52w": -0.0563,
+        "rs": -0.1339,
+        "revenue_growth": -0.0367
+      },
+      "weights": {
+        "divergence": 0.0354,
+        "theme_momentum": 0.1715,
+        "breadth": 0.0,
+        "momentum_12_1": 0.1236,
+        "reversal_1m": 0.6696,
+        "low_vol": 0.0,
+        "high_52w": 0.0,
+        "rs": 0.0,
+        "revenue_growth": 0.0
+      },
+      "val_ic_total": -0.2237,
+      "top_q_option_hit": 0.4587,
+      "bottom_q_option_hit": 0.6111,
+      "degenerate_train": false
+    }
+  ],
+  "validation": {
+    "median_val_ic_total": -0.0899,
+    "median_top_q_option_hit": 0.4486,
+    "top_beats_bottom_fraction": 0.0,
+    "passed": false
+  },
+  "n_samples": 1740,
+  "n_folds": 4,
+  "horizon": "90",
+  "adoption_criteria": {
+    "min_median_val_ic_total": 0.0,
+    "min_median_top_q_option_hit": 0.55,
+    "min_top_beats_bottom_fraction": 0.5
+  },
+  "generated_at": "2026-08-01T13:58:51.986398+00:00",
+  "notes": [
+    "Weights are derived from max(IC, 0) only — a negative or unmeasurable (None) component IC gets ZERO weight and is NEVER inverted, which would fit in-sample noise and fail out-of-sample.",
+    "Validation folds are strictly out-of-sample: fold k's weights are trained ONLY on the earlier folds [0..k-1] and never see fold k.",
+    "passed=False reflects the adoption criteria (median_val_ic_total > 0.0, median_top_q_option_hit >= 0.55, top_beats_bottom_fraction >= 0.5). passed=False means the calibrated scoring did NOT show out-of-sample edge — keep it in observation-only mode, do not gate live trades on it.",
+    "weights_final is derived over ALL samples for production use and is only meaningful when passed=True; when passed=False it is reported for transparency, not for adoption."
+  ]
+}
