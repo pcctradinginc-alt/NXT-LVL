@@ -264,6 +264,17 @@
         },
         "frequency": 1,
         "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 1,
+          "github_trends": 0,
+          "arxiv_trends": 1,
+          "hn_buzz": 0
+        },
+        "frequency": 2,
+        "source_diversity": 2
       }
     ],
     "dc_cooling": [
@@ -530,6 +541,17 @@
         },
         "frequency": 11,
         "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 13,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 13,
+        "source_diversity": 1
       }
     ],
     "power_grid": [
@@ -788,6 +810,17 @@
       },
       {
         "date": "2026-08-04",
+        "per_source_counts": {
+          "edgar_fts": 1,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 1,
+        "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
         "per_source_counts": {
           "edgar_fts": 1,
           "github_trends": 0,
@@ -1062,6 +1095,17 @@
         },
         "frequency": 6,
         "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 6,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 6,
+        "source_diversity": 1
       }
     ],
     "hbm_memory": [
@@ -1327,6 +1371,17 @@
           "hn_buzz": 0
         },
         "frequency": 12,
+        "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 16,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 16,
         "source_diversity": 1
       }
     ],
@@ -1594,6 +1649,17 @@
         },
         "frequency": 6,
         "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 5,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 5,
+        "source_diversity": 1
       }
     ],
     "edge_ai": [
@@ -1852,6 +1918,17 @@
       },
       {
         "date": "2026-08-04",
+        "per_source_counts": {
+          "edgar_fts": 6,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 6,
+        "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
         "per_source_counts": {
           "edgar_fts": 6,
           "github_trends": 0,
@@ -2126,6 +2203,17 @@
         },
         "frequency": 25,
         "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 26,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 26,
+        "source_diversity": 1
       }
     ],
     "enterprise_automation": [
@@ -2391,6 +2479,17 @@
           "hn_buzz": 0
         },
         "frequency": 76,
+        "source_diversity": 2
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 73,
+          "github_trends": 2,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 75,
         "source_diversity": 2
       }
     ],
@@ -2658,6 +2757,17 @@
         },
         "frequency": 3,
         "source_diversity": 2
+      },
+      {
+        "date": "2026-08-05",
+        "per_source_counts": {
+          "edgar_fts": 1,
+          "github_trends": 2,
+          "arxiv_trends": 1,
+          "hn_buzz": 0
+        },
+        "frequency": 4,
+        "source_diversity": 3
       }
     ],
     "data_infra": [
@@ -2916,6 +3026,17 @@
       },
       {
         "date": "2026-08-04",
+        "per_source_counts": {
+          "edgar_fts": 89,
+          "github_trends": 0,
+          "arxiv_trends": 0,
+          "hn_buzz": 0
+        },
+        "frequency": 89,
+        "source_diversity": 1
+      },
+      {
+        "date": "2026-08-05",
         "per_source_counts": {
           "edgar_fts": 89,
           "github_trends": 0,
