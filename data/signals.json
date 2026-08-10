@@ -136,6 +136,11 @@
         "date": "2026-08-07",
         "option_mid": null,
         "dte": null
+      },
+      {
+        "date": "2026-08-10",
+        "option_mid": null,
+        "dte": null
       }
     ],
     "result": null,
@@ -283,6 +288,11 @@
         "date": "2026-08-07",
         "option_mid": 10.9,
         "dte": 105
+      },
+      {
+        "date": "2026-08-10",
+        "option_mid": 12.6,
+        "dte": 102
       }
     ],
     "result": null,
@@ -330,7 +340,21 @@
       "via": "watchlist"
     },
     "emergence_at_signal": null,
-    "horizon_evals": {},
+    "horizon_evals": {
+      "30": {
+        "abs_return": -19.42,
+        "benchmark_return": 4.89,
+        "alpha": -24.31,
+        "max_drawdown": 24.7,
+        "hit": false,
+        "hit_basis": "option",
+        "preceded_move": false,
+        "option_profitable": false,
+        "option_liquidity": "gut",
+        "thesis_confirmed": false,
+        "evaluated_date": "2026-08-10"
+      }
+    },
     "structure": {
       "iv_expensive": false,
       "realized_vol": 0.5014151957430701,
