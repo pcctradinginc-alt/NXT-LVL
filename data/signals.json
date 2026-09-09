@@ -246,6 +246,11 @@
         "date": "2026-09-08",
         "option_mid": null,
         "dte": null
+      },
+      {
+        "date": "2026-09-09",
+        "option_mid": null,
+        "dte": null
       }
     ],
     "result": null,
@@ -503,6 +508,11 @@
         "date": "2026-09-08",
         "option_mid": 17.9,
         "dte": 73
+      },
+      {
+        "date": "2026-09-09",
+        "option_mid": 19.225,
+        "dte": 72
       }
     ],
     "result": null,
@@ -563,6 +573,19 @@
         "option_liquidity": "gut",
         "thesis_confirmed": false,
         "evaluated_date": "2026-08-10"
+      },
+      "60": {
+        "abs_return": -9.67,
+        "benchmark_return": -7.73,
+        "alpha": -1.94,
+        "max_drawdown": 24.7,
+        "hit": false,
+        "hit_basis": "option",
+        "preceded_move": false,
+        "option_profitable": false,
+        "option_liquidity": "gut",
+        "thesis_confirmed": false,
+        "evaluated_date": "2026-09-09"
       }
     },
     "structure": {
