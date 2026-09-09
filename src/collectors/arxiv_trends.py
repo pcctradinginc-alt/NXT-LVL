@@ -53,12 +53,18 @@ def collect(stage_keywords: dict[int, list[str]] | None = None) -> dict[str, Any
         "source": "arxiv_trends",
         "stage_paper_counts": {stage_id: count, ...},
         "sample_hot_titles": [title, ...],
+        "paper_count": int,  # raw number of papers the feed returned this
+                             # run (0 if the fetch/parse failed) — a
+                             # headline "volume vs. expectation" input for
+                             # src/main.py's data-quality scoring, distinct
+                             # from the derived per-stage counts above.
       }
     """
     result: dict[str, Any] = {
         "source": "arxiv_trends",
         "stage_paper_counts": {},
         "sample_hot_titles": [],
+        "paper_count": 0,
     }
 
     if os.environ.get("NXT_OFFLINE") == "1":
@@ -89,6 +95,7 @@ def collect(stage_keywords: dict[int, list[str]] | None = None) -> dict[str, Any
 
     result["stage_paper_counts"] = _count_keywords(papers, stage_keywords)
     result["sample_hot_titles"] = [p["title"] for p in papers[:TOP_TITLES] if p["title"]]
+    result["paper_count"] = len(papers)
 
     logger.info("arxiv_trends: analyzed %d papers", len(papers))
     return result

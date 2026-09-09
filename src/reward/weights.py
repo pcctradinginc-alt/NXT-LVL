@@ -102,6 +102,20 @@ def current_reliability(obj: dict[str, Any]) -> dict[str, float]:
     return dict(obj.get("source_reliability", {}))
 
 
+def matured_evaluation_count(obj: dict[str, Any]) -> int:
+    """Genuine count of matured signal-horizon evaluations folded into the
+    cumulative ledger so far — i.e. `len(obj["rewarded_evals"])` (see
+    `engine.accumulate_ledger`, which appends one key per consumed
+    signal/horizon evaluation, exactly once each). This is already
+    persisted for free every time `save()` writes weights.json, since
+    `rewarded_evals` is part of that same object. Backs the reward engine's
+    global evidence gate (`reward.min_matured_signals` in config.yaml): a
+    per-ledger-entry `min_samples` only protects one feature/source at a
+    time, not the system as a whole while overall evidence is still tiny.
+    """
+    return len(obj.get("rewarded_evals", []) or [])
+
+
 def record_change(
     obj: dict[str, Any],
     target: str,

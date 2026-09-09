@@ -344,3 +344,226 @@ def test_append_digest_history_never_raises(tmp_path: Path):
         all_theme_scores=None,
         emergent_themes=None,
     )
+
+
+# ---------------------------------------------------------------------------
+# append_digest_history: enriched point-in-time record (#4)
+# ---------------------------------------------------------------------------
+
+def test_append_digest_history_enriched_fields(tmp_path: Path, monkeypatch):
+    from src.config import load_settings
+
+    monkeypatch.setenv("GITHUB_SHA", "deadbeefcafe")
+    path = tmp_path / "digest_history.jsonl"
+    settings = load_settings()
+
+    top_pick = {
+        "ticker": "VRT",
+        "total_score": 82.5,
+        "scores": {
+            "breadth": 80.0, "momentum": 70.0, "stage_fit": 100.0,
+            "divergence": 70.0, "option_quality": 60.0, "emergence": 55.0,
+        },
+        "source_count": 3,
+        "option": {
+            "occ_symbol": "VRT270115C00100000",
+            "strike": 100.0,
+            "expiration": "2027-01-15",
+            "dte": 130,
+            "delta": 0.65,
+            "bid": 4.9,
+            "ask": 5.0,
+            "mid": 4.95,
+            "iv": 0.42,
+            "open_interest": 800,
+            "spread_pct": 0.02,
+        },
+    }
+    digest = {
+        "edgar_capex": {"source": "edgar_capex", "companies": {"MSFT": {}}, "aggregate_capex_yoy_pct": 25.0},
+        "github_trends": {"source": "github_trends", "top_new_repos": [{"name": "a/b", "stars": 5}], "stage_heat": {}},
+        "arxiv_trends": {"source": "arxiv_trends", "stage_paper_counts": {}, "paper_count": 150},
+        "hn_buzz": {"source": "hn_buzz", "stage_buzz": {3: {"stories": 4, "points": 60}}},
+        "edgar_fts": {"source": "edgar_fts", "theme_counts": {"dc_cooling": 7}},
+    }
+    perf_lookup = {"VRT": 3.2}
+    data_quality_detail = {"overall": 88.0, "sources": {"edgar_capex": {"score": 90.0}}}
+    effective_weights = {"breadth": 0.2, "momentum": 0.2}
+
+    append_digest_history(
+        path,
+        current_stage=2,
+        next_stage=3,
+        top_pick=top_pick,
+        scored_candidates=[top_pick],
+        all_theme_scores={"dc_cooling": 78.0},
+        emergent_themes=[{"theme_id": "dc_cooling", "name": "Data Center Cooling"}],
+        settings=settings,
+        digest=digest,
+        perf_lookup=perf_lookup,
+        data_quality_detail=data_quality_detail,
+        effective_weights=effective_weights,
+        calibration_status="passed=false",
+    )
+
+    record = json.loads(path.read_text(encoding="utf-8").strip().splitlines()[0])
+
+    # Existing fields still present.
+    assert record["top_pick"] == "VRT"
+
+    # Code identity.
+    assert record["git_commit_sha"] == "deadbeefcafe"
+
+    # Config identity.
+    assert isinstance(record["config_hash"], str) and record["config_hash"]
+    assert record["config_thresholds"]["signal_threshold"] == settings.signal_threshold
+    assert record["config_thresholds"]["min_sources"] == settings.min_sources
+    assert record["config_thresholds"]["min_data_quality"] == settings.min_data_quality
+    assert record["config_thresholds"]["cluster_min_members"] == settings.cluster_min_members
+    assert record["config_thresholds"]["cluster_score_bar"] == settings.cluster_score_bar
+
+    # Universe version: hash + count always; full list on this (first) run.
+    assert isinstance(record["universe_hash"], str) and record["universe_hash"]
+    assert record["universe_count"] > 0
+    assert "universe_tickers" in record
+    assert record["universe_tickers"] == sorted(record["universe_tickers"])
+
+    # Raw collector counts (inputs, not derived scores).
+    counts = record["collector_counts"]
+    assert counts["edgar_capex_companies_covered"] == 1
+    assert counts["edgar_capex_aggregate_yoy_pct"] == 25.0
+    assert counts["github_repo_count"] == 1
+    assert counts["arxiv_paper_count"] == 150
+    assert counts["hn_buzz_total_stories"] == 4
+    assert counts["hn_buzz_total_points"] == 60
+    assert counts["edgar_fts_theme_counts"] == {"dc_cooling": 7}
+
+    # Prices.
+    assert record["perf_lookup"] == {"VRT": 3.2}
+
+    # Option snapshot.
+    snap = record["option_snapshot"]
+    assert snap["strike"] == 100.0
+    assert snap["dte"] == 130
+    assert snap["delta"] == 0.65
+    assert snap["iv"] == 0.42
+    assert snap["open_interest"] == 800
+
+    # Data-quality breakdown, effective weights, calibration status.
+    assert record["data_quality"] == data_quality_detail
+    assert record["effective_weights"] == effective_weights
+    assert record["calibration_status"] == "passed=false"
+
+
+def test_append_digest_history_universe_list_only_stored_on_change(tmp_path: Path):
+    from src.config import load_settings
+
+    path = tmp_path / "digest_history.jsonl"
+    settings = load_settings()
+
+    def _append():
+        append_digest_history(
+            path,
+            current_stage=1,
+            next_stage=None,
+            top_pick=None,
+            scored_candidates=[],
+            all_theme_scores=None,
+            emergent_themes=None,
+            settings=settings,
+        )
+
+    _append()
+    _append()
+
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").strip().splitlines()]
+    assert len(lines) == 2
+    # First run: universe unchanged since (no) previous record -> stored.
+    assert "universe_tickers" in lines[0]
+    # Second run: same config -> same universe hash -> full list omitted to
+    # keep the file from bloating; the hash+count still identify it.
+    assert "universe_tickers" not in lines[1]
+    assert lines[1]["universe_hash"] == lines[0]["universe_hash"]
+
+
+def test_append_digest_history_without_settings_omits_new_optional_fields(tmp_path: Path):
+    # Backward compatibility: every new argument defaults to None, so a
+    # caller that only passes the original fields (as the pre-existing
+    # tests above do) gets a record with none of the new keys rather than
+    # a crash or half-filled data.
+    path = tmp_path / "digest_history.jsonl"
+    append_digest_history(
+        path,
+        current_stage=1,
+        next_stage=2,
+        top_pick=None,
+        scored_candidates=[],
+        all_theme_scores=None,
+        emergent_themes=None,
+    )
+    record = json.loads(path.read_text(encoding="utf-8").strip().splitlines()[0])
+    for key in (
+        "config_hash", "config_thresholds", "universe_hash", "universe_count",
+        "universe_tickers", "collector_counts", "perf_lookup", "option_snapshot",
+        "data_quality", "effective_weights", "calibration_status",
+    ):
+        assert key not in record
+    # git_commit_sha is always attempted (no settings needed for it).
+    assert "git_commit_sha" in record
+
+
+def test_append_digest_history_size_budget_enforced(tmp_path: Path, monkeypatch):
+    # A pathologically large record (huge universe + many candidates) must
+    # still be shrunk to roughly MAX_DIGEST_HISTORY_RECORD_BYTES so the
+    # committed JSONL file doesn't grow unbounded.
+    import src.main as main_mod
+
+    monkeypatch.setattr(main_mod, "MAX_DIGEST_HISTORY_RECORD_BYTES", 2_000)
+    path = tmp_path / "digest_history.jsonl"
+
+    many_candidates = [
+        {
+            "ticker": f"T{i}",
+            "total_score": 50.0,
+            "scores": {"breadth": 50.0, "momentum": 50.0, "stage_fit": 50.0, "divergence": 50.0, "option_quality": 50.0, "emergence": 50.0},
+            "source_count": 2,
+        }
+        for i in range(100)
+    ]
+
+    class FakeSettings:
+        raw = {"big": ["x" for _ in range(500)]}
+        stages = [{"id": 1, "tickers": [f"S{i}" for i in range(200)]}]
+        themes = [{"id": "t", "tickers": [f"S{i}" for i in range(200)]}]
+        signal_threshold = 60
+        min_sources = 2
+        min_data_quality = 45
+        cluster_min_members = 2
+        cluster_score_bar = 45
+
+        def watchlist_tickers(self):
+            tickers = set()
+            for stage in self.stages:
+                tickers.update(stage.get("tickers", []))
+            return tickers
+
+    append_digest_history(
+        path,
+        current_stage=1,
+        next_stage=2,
+        top_pick=None,
+        scored_candidates=many_candidates,
+        all_theme_scores=None,
+        emergent_themes=None,
+        settings=FakeSettings(),
+        digest={"edgar_fts": {"source": "edgar_fts", "theme_counts": {f"theme{i}": i for i in range(200)}}},
+    )
+
+    line = path.read_text(encoding="utf-8").strip().splitlines()[0]
+    # Not a hard guarantee (candidates alone can still be large), but the
+    # shrink steps (dropping universe_tickers, edgar_fts_theme_counts, then
+    # capping candidates) must have measurably reduced the size versus the
+    # unshrunk record.
+    record = json.loads(line)
+    assert "universe_tickers" not in record
+    assert len(record["candidates"]) <= 20

@@ -276,7 +276,38 @@ def recompute_weights(
     previous engine's behavior.
 
     Returns the updated (and already-history-appended) weights_obj.
+
+    Global evidence gate (fix): `accumulate_ledger` above keeps folding
+    newly-matured signal evaluations into the cumulative ledger every run —
+    that is just bookkeeping and must never stop. But actually APPLYING any
+    change to production feature weights or source reliabilities is
+    withheld until the cumulative number of matured evaluations
+    (`len(weights_obj["rewarded_evals"])` — a genuine count of consumed
+    signal-horizon evaluations, not a per-target sample count) reaches
+    `reward_cfg["min_matured_signals"]` (default 150). Without this, a
+    per-ledger-entry `min_samples` of 5 would let the engine start "learning"
+    production weights from a handful of noisy early signals, and because
+    the update is convergent/self-reinforcing (see module docstring), an
+    early noisy conclusion would otherwise persist.
     """
+    matured = weights_mod.matured_evaluation_count(weights_obj)
+    min_matured_signals = int(reward_cfg.get("min_matured_signals", 150))
+    if matured < min_matured_signals:
+        logger.info(
+            "reward.engine: weight adaptation SUPPRESSED — %d/%d matured evaluations "
+            "(need >=%d before learning from forward evidence)",
+            matured,
+            min_matured_signals,
+            min_matured_signals,
+        )
+        # Leave feature_weights/source_reliability exactly as they are
+        # (base/config defaults, or whatever was last persisted) — the
+        # ledger keeps accumulating (accumulate_ledger already ran), but no
+        # adjustment is applied while the global evidence gate is shut.
+        weights_obj.setdefault("feature_weights", dict(base_feature_weights))
+        weights_obj.setdefault("source_reliability", dict(base_reliability))
+        return weights_obj
+
     weight_bounds = reward_cfg.get("weight_bounds", {}) or {}
     w_min = float(weight_bounds.get("min", 0.05))
     w_max = float(weight_bounds.get("max", 0.45))

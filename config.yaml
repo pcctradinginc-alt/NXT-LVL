@@ -59,6 +59,22 @@ scoring:
   # already-selected top pick), which lifts realistic scores meaningfully
   # above the old placeholder-driven baseline. 60 is the new bar.
   signal_threshold: 60
+  # Source families: two credited sources are not automatically two
+  # independent pieces of evidence. jobs_hn and hn_buzz are both Hacker
+  # News (same ecosystem, often the same people); edgar_capex, edgar_fts
+  # and edgar_language are all SEC filings, heavily correlated with each
+  # other. score_breadth/source_count now use an EFFECTIVE source count:
+  # within one family, the first credited source counts 1.0 and each
+  # additional source from that SAME family counts only
+  # `within_family_weight` — so edgar_capex+edgar_fts gives 1.35 (does NOT
+  # clear a 2-source bar), while edgar_capex+github_trends gives a full 2.0.
+  # min_sources below is now checked against this effective count.
+  source_families:
+    sec: ["edgar_capex", "edgar_fts", "edgar_language"]
+    developers: ["github_trends"]
+    hackernews: ["jobs_hn", "hn_buzz"]
+    research: ["arxiv_trends"]
+  within_family_weight: 0.35
   min_sources: 2
   cooldown_days: 14
   # Data-quality gate (#17): suppress the signal outright (instead of
@@ -110,6 +126,30 @@ options:
 tracking:
   close_after_trading_days: 60
   close_at_dte: 40
+
+# ---------------------------------------------------------------------------
+# Data quality (#17 follow-up): a per-source quality breakdown instead of a
+# single opaque "did it return something" number. `expected_volume` is the
+# rough baseline record count a healthy run should see for that collector
+# (arXiv's Atom feed caps at ~200 papers per query, a "who is hiring" thread
+# usually has 300+ comments once the AI hiring wave is in full swing, GitHub
+# search returns up to ~20 repos/query, HN buzz search is capped similarly);
+# `expected_companies` is the coverage baseline for the per-company SEC
+# collectors (N/M companies actually covered vs. configured). The
+# per-stage/per-theme coverage baselines (edgar_fts, github_trends, jobs_hn,
+# hn_buzz) are derived directly from len(stages)/len(themes) above, not
+# repeated here. See src/main.py compute_data_quality_detail.
+# ---------------------------------------------------------------------------
+
+data_quality:
+  expected_volume:
+    arxiv_trends: 200
+    jobs_hn: 300
+    github_trends: 20
+    hn_buzz: 20
+  expected_companies:
+    edgar_capex: 6
+    edgar_language: 6
 
 # ---------------------------------------------------------------------------
 # Sector benchmarks (#11): map each 7-stage watchlist stage to the ETF a
@@ -275,3 +315,12 @@ reward:
     max: 1.5
   min_samples: 5
   overheated_score_threshold: 80
+  # Global evidence gate: min_samples above only gates a single ledger
+  # ENTRY (one feature/source), which is meaningless protection while the
+  # overall ledger is tiny and self-reinforcing. min_matured_signals gates
+  # weight adaptation GLOBALLY: the ledger keeps accumulating every run
+  # (pure bookkeeping), but production feature weights/source reliabilities
+  # are not allowed to move away from their base/config values until the
+  # cumulative count of matured signal-horizon evaluations reaches this
+  # threshold. See src/reward/engine.py recompute_weights.
+  min_matured_signals: 150

@@ -22,7 +22,13 @@ from src.emergence import detector as emergence_detector
 from src.mailer import build_email
 from src.options.tradier import TradierClient
 from src import tracking
-from src.main import _cluster_member_count, _drop_megacaps, apply_claims_adjustment, compute_data_quality
+from src.main import (
+    _cluster_member_count,
+    _drop_megacaps,
+    apply_claims_adjustment,
+    compute_data_quality,
+    compute_data_quality_detail,
+)
 from src.reward import engine as reward_engine
 from src.reward import evaluator as reward_evaluator
 from src.reward import weights as weights_mod
@@ -62,23 +68,31 @@ FIXTURE_DIGEST = {
 
 
 def test_score_breadth_counts_only_active_sources():
+    # FIXTURE_DIGEST has no edgar_fts/edgar_language blocks at all, so those
+    # two "sec" family members are never credited here — the 5 credited
+    # sources (edgar_capex, github_trends, jobs_hn, hn_buzz, arxiv_trends)
+    # give an effective count of 4.35 (jobs_hn+hn_buzz share the
+    # "hackernews" family: 1.0 + 0.35), out of a structural max of 5.05
+    # (crediting every source in every family, see
+    # scoring.DEFAULT_SOURCE_FAMILIES) -> 4.35/5.05*100.
     candidate = {
         "ticker": "VRT",
         "stage_id": 3,
         "source_evidence": ["edgar_capex", "github_trends", "jobs_hn", "hn_buzz", "arxiv_trends"],
     }
     breadth = scoring.score_breadth(candidate, FIXTURE_DIGEST)
-    assert breadth == pytest.approx(100.0)
+    assert breadth == pytest.approx(4.35 / 5.05 * 100)
 
 
 def test_score_breadth_partial_sources():
     # stage_id=1 has no per-stage activity in FIXTURE_DIGEST for github_trends,
     # jobs_hn, arxiv_trends, or hn_buzz (none of them have a stage-1 entry), so
     # only the explicit source_evidence ("edgar_capex", which is also credited
-    # via its stage-agnostic aggregate figure) is counted -> 1/5 sources.
+    # via its stage-agnostic aggregate figure) is counted -> effective count
+    # 1.0 (a single "sec"-family source) out of the same 5.05 structural max.
     candidate = {"ticker": "VRT", "stage_id": 1, "source_evidence": ["edgar_capex"]}
     breadth = scoring.score_breadth(candidate, FIXTURE_DIGEST)
-    assert breadth == pytest.approx(20.0)
+    assert breadth == pytest.approx(1.0 / 5.05 * 100)
 
 
 def test_score_stage_fit_exact_and_adjacent_and_none():
@@ -212,6 +226,63 @@ def test_breadth_credits_stage_active_sources():
     assert scored["scores"]["breadth"] > 20.0
     credited = scoring._credited_sources(candidate, FIXTURE_DIGEST)
     assert credited == {"jobs_hn", "github_trends", "arxiv_trends", "hn_buzz", "edgar_capex"}
+
+
+# ---------------------------------------------------------------------------
+# Source families: effective (family-dampened) source count
+# ---------------------------------------------------------------------------
+
+def test_effective_source_count_same_family_dampened():
+    # edgar_capex + edgar_fts are both "sec" -> the second one counts only
+    # within_family_weight (0.35), not a full independent 1.0.
+    count = scoring.effective_source_count({"edgar_capex", "edgar_fts"})
+    assert count == pytest.approx(1.35)
+
+
+def test_effective_source_count_cross_family_full_credit():
+    # edgar_capex + github_trends are different families -> both count in
+    # full, giving a full 2.0 -- this is the exact contrast the fix exists
+    # for: two same-family sources must NOT look like two independent ones.
+    count = scoring.effective_source_count({"edgar_capex", "github_trends"})
+    assert count == pytest.approx(2.0)
+
+
+def test_effective_source_count_three_same_family_still_dampened():
+    # All three SEC sources credited: first counts 1.0, the other two each
+    # only 0.35 -> 1.7, nowhere near a naive flat count of 3.0.
+    count = scoring.effective_source_count({"edgar_capex", "edgar_fts", "edgar_language"})
+    assert count == pytest.approx(1.7)
+
+
+def test_effective_source_count_custom_family_config():
+    # source_families/within_family_weight are config-driven (not hardcoded)
+    # -- a custom grouping/weight changes the result accordingly.
+    custom_families = {"solo": ["a"], "duo": ["b", "c"]}
+    count = scoring.effective_source_count({"b", "c"}, source_families=custom_families, within_family_weight=0.5)
+    assert count == pytest.approx(1.5)
+
+
+def test_min_sources_gate_rejects_two_same_family_sources():
+    # This is the whole point of the fix, exercised at the min_sources gate
+    # main.py actually applies: two Hacker News sources (jobs_hn + hn_buzz)
+    # must NOT clear a `< 2` gate the way two independent sources would.
+    digest = {
+        "jobs_hn": {"source": "jobs_hn", "stage_job_counts": {1: 5}, "stage_job_mom_change": {}, "total_comments": 50},
+        "hn_buzz": {"source": "hn_buzz", "stage_buzz": {1: {"stories": 3, "points": 40}}},
+    }
+    same_family_candidate = {"ticker": "AAA", "stage_id": 1, "source_evidence": ["jobs_hn", "hn_buzz"]}
+    scored_same = scoring.score_candidate(same_family_candidate, digest, next_stage=1)
+    assert scored_same["source_count"] == pytest.approx(1.35)
+    assert scored_same["source_count"] < 2  # would incorrectly clear min_sources: 2 if not dampened
+
+    digest_cross = {
+        "edgar_capex": {"source": "edgar_capex", "companies": {}, "aggregate_capex_yoy_pct": 10.0},
+        "github_trends": {"source": "github_trends", "top_new_repos": [{"name": "x/y", "stars": 5}], "stage_heat": {1: 10}},
+    }
+    cross_family_candidate = {"ticker": "BBB", "stage_id": 1, "source_evidence": ["edgar_capex", "github_trends"]}
+    scored_cross = scoring.score_candidate(cross_family_candidate, digest_cross, next_stage=1)
+    assert scored_cross["source_count"] == pytest.approx(2.0)
+    assert scored_cross["source_count"] >= 2  # correctly clears min_sources: 2
 
 
 def test_score_candidate_with_good_option_and_divergence_clears_threshold():
@@ -950,7 +1021,11 @@ def test_reward_weights_converge_not_drift():
             },
             "sources": {},
         },
-        "rewarded_evals": [],
+        # This test is about convergence behavior, not the global evidence
+        # gate (see test_reward_engine_global_gate_* below) -- populate
+        # rewarded_evals past min_matured_signals (default 150) so the gate
+        # doesn't suppress the very adjustment this test is checking for.
+        "rewarded_evals": [f"sig{i}:90" for i in range(150)],
     }
     reward_cfg = _base_reward_cfg()
 
@@ -991,6 +1066,102 @@ def test_reward_skips_when_below_min_samples():
 
     updated = reward_engine.recompute_weights(weights_obj, reward_cfg, base_feature_weights, base_reliability)
     assert updated["feature_weights"]["stage_fit"] == pytest.approx(base_feature_weights["stage_fit"])
+
+
+# ---------------------------------------------------------------------------
+# Reward engine: GLOBAL evidence gate (min_matured_signals)
+# ---------------------------------------------------------------------------
+
+def _strong_ledger_weights_obj(base_feature_weights, base_reliability, rewarded_evals):
+    return {
+        "feature_weights": dict(base_feature_weights),
+        "source_reliability": dict(base_reliability),
+        "history": [],
+        "ledger": {
+            # High win rate, well above the per-entry min_samples (5) --
+            # if the global gate were open, this would clearly move
+            # momentum's weight.
+            "features": {"momentum": {"n": 40.0, "wins": 36.0, "sum_reward": 200.0}},
+            "sources": {},
+        },
+        "rewarded_evals": rewarded_evals,
+    }
+
+
+def test_reward_engine_global_gate_suppresses_below_threshold():
+    base_feature_weights = {
+        "breadth": 0.20, "momentum": 0.20, "stage_fit": 0.15,
+        "divergence": 0.15, "option_quality": 0.10, "emergence": 0.20,
+    }
+    base_reliability = {src: 1.0 for src in scoring.ALL_SOURCES}
+    # Only 12 matured evaluations folded into the ledger so far -- nowhere
+    # near the default min_matured_signals=150 -- so weight adaptation must
+    # be suppressed GLOBALLY, even though this one ledger entry individually
+    # clears its own per-entry min_samples.
+    weights_obj = _strong_ledger_weights_obj(
+        base_feature_weights, base_reliability, [f"sig{i}:90" for i in range(12)]
+    )
+    reward_cfg = _base_reward_cfg(min_matured_signals=150)
+
+    updated = reward_engine.recompute_weights(weights_obj, reward_cfg, base_feature_weights, base_reliability)
+
+    assert updated["feature_weights"] == base_feature_weights
+    assert updated["source_reliability"] == base_reliability
+
+
+def test_reward_engine_global_gate_allows_above_threshold():
+    base_feature_weights = {
+        "breadth": 0.20, "momentum": 0.20, "stage_fit": 0.15,
+        "divergence": 0.15, "option_quality": 0.10, "emergence": 0.20,
+    }
+    base_reliability = {src: 1.0 for src in scoring.ALL_SOURCES}
+    # Exactly at (and then past) the default min_matured_signals=150 --
+    # weight adaptation should now be allowed to actually move momentum's
+    # weight up, per the strong ledger entry.
+    weights_obj = _strong_ledger_weights_obj(
+        base_feature_weights, base_reliability, [f"sig{i}:90" for i in range(150)]
+    )
+    reward_cfg = _base_reward_cfg(min_matured_signals=150)
+
+    updated = reward_engine.recompute_weights(weights_obj, reward_cfg, base_feature_weights, base_reliability)
+
+    assert updated["feature_weights"]["momentum"] > base_feature_weights["momentum"]
+
+
+def test_reward_engine_global_gate_default_is_150():
+    # No min_matured_signals key at all in reward_cfg -> defaults to 150
+    # (the intended 100-200 range), matching config.yaml's documented default.
+    base_feature_weights = {
+        "breadth": 0.20, "momentum": 0.20, "stage_fit": 0.15,
+        "divergence": 0.15, "option_quality": 0.10, "emergence": 0.20,
+    }
+    base_reliability = {src: 1.0 for src in scoring.ALL_SOURCES}
+    weights_obj = _strong_ledger_weights_obj(
+        base_feature_weights, base_reliability, [f"sig{i}:90" for i in range(149)]
+    )
+    reward_cfg = _base_reward_cfg()  # no min_matured_signals override
+    assert "min_matured_signals" not in reward_cfg
+
+    updated = reward_engine.recompute_weights(weights_obj, reward_cfg, base_feature_weights, base_reliability)
+    assert updated["feature_weights"] == base_feature_weights  # still suppressed at 149
+
+
+def test_reward_engine_accumulate_ledger_keeps_running_while_suppressed():
+    # accumulate_ledger (the bookkeeping step) must keep folding new
+    # evaluations into the cumulative ledger regardless of the global gate
+    # -- only recompute_weights (the "apply to production weights" step)
+    # is gated.
+    weights_obj = {
+        "feature_weights": {"momentum": 0.2},
+        "source_reliability": {"edgar_capex": 1.0},
+        "history": [],
+        "ledger": {"features": {}, "sources": {}},
+        "rewarded_evals": [],
+    }
+    signals = [_signal_with_eval("sA", 90, True, 5.0, {"momentum": 40.0}, ["edgar_capex"])]
+    consumed = reward_engine.accumulate_ledger(weights_obj, signals, primary_horizon=90, overheated_threshold=80.0)
+    assert consumed == 1
+    assert weights_mod.matured_evaluation_count(weights_obj) == 1
 
 
 def test_report_explains_candidate():
@@ -1319,6 +1490,105 @@ def test_data_quality_gate_blocks():
     }
     dq = compute_data_quality(sparse_digest)
     assert dq < settings.min_data_quality
+
+
+FULL_DQ_DIGEST = {
+    "edgar_capex": {
+        "source": "edgar_capex",
+        "companies": {t: {} for t in ("MSFT", "GOOGL", "AMZN", "META", "ORCL", "NVDA")},
+        "aggregate_capex_yoy_pct": 25.0,
+    },
+    "edgar_language": {
+        "source": "edgar_language",
+        "companies": {t: {} for t in ("MSFT", "GOOGL", "AMZN", "META", "ORCL", "NVDA")},
+        "aggregate": {"backlog": 3},
+    },
+    "edgar_fts": {"source": "edgar_fts", "theme_counts": {f"theme{i}": 5 for i in range(11)}},
+    "github_trends": {
+        "source": "github_trends",
+        "top_new_repos": [{"name": f"x/{i}", "stars": i} for i in range(20)],
+        "stage_heat": {i: 10.0 for i in range(1, 8)},
+    },
+    "jobs_hn": {
+        "source": "jobs_hn",
+        "stage_job_counts": {i: 5 for i in range(1, 8)},
+        "stage_job_mom_change": {},
+        "total_comments": 300,
+    },
+    "arxiv_trends": {
+        "source": "arxiv_trends",
+        "stage_paper_counts": {i: 5 for i in range(1, 8)},
+        "sample_hot_titles": ["A paper"],
+        "paper_count": 200,
+    },
+    "hn_buzz": {
+        "source": "hn_buzz",
+        "stage_buzz": {i: {"stories": 3, "points": 40} for i in range(1, 8)},
+    },
+}
+
+
+def test_data_quality_detail_full_digest_scores_high():
+    # Every collector fully hit its expected baseline (6/6 companies, 20
+    # repos, 300 comments, 200 papers, all 7 stages covered) -> overall
+    # should land at/near 100, not just "above the min_data_quality bar".
+    detail = compute_data_quality_detail(FULL_DQ_DIGEST)
+    assert detail["overall"] >= 95.0
+    assert set(detail["sources"]) == set(
+        ["edgar_capex", "edgar_fts", "edgar_language", "github_trends", "jobs_hn", "arxiv_trends", "hn_buzz"]
+    )
+    for source, info in detail["sources"].items():
+        assert info["score"] >= 90.0, f"{source} scored {info['score']}"
+
+
+def test_data_quality_detail_low_coverage_case():
+    # Same shape as FULL_DQ_DIGEST but edgar_capex only covers 3 of the 6
+    # expected companies -- "the API returned some number" should not
+    # automatically mean "good data": a 3/6 result must score materially
+    # worse than the 6/6 baseline, via the coverage sub-score specifically.
+    low_coverage_digest = dict(FULL_DQ_DIGEST)
+    low_coverage_digest["edgar_capex"] = {
+        "source": "edgar_capex",
+        "companies": {t: {} for t in ("MSFT", "GOOGL", "AMZN")},
+        "aggregate_capex_yoy_pct": 25.0,
+    }
+    full_detail = compute_data_quality_detail(FULL_DQ_DIGEST)
+    low_detail = compute_data_quality_detail(low_coverage_digest)
+
+    full_edgar = full_detail["sources"]["edgar_capex"]
+    low_edgar = low_detail["sources"]["edgar_capex"]
+    assert low_edgar["coverage"] == pytest.approx(50.0)
+    assert full_edgar["coverage"] == pytest.approx(100.0)
+    assert low_edgar["score"] < full_edgar["score"]
+    assert low_detail["overall"] < full_detail["overall"]
+
+
+def test_data_quality_detail_degraded_marker_penalizes_score():
+    # A collector that records an explicit degraded/error marker (the
+    # lightweight hook collectors MAY set, see src/main.py
+    # _dq_degradation_penalty) is capped at 50, even if its other sub-scores
+    # would otherwise look fine.
+    digest = dict(FULL_DQ_DIGEST)
+    digest["github_trends"] = {
+        **FULL_DQ_DIGEST["github_trends"],
+        "degraded": True,
+    }
+    detail = compute_data_quality_detail(digest)
+    assert detail["sources"]["github_trends"]["degraded"] is True
+    assert detail["sources"]["github_trends"]["score"] <= 50.0
+
+
+def test_data_quality_detail_missing_source_scores_zero():
+    detail = compute_data_quality_detail({})
+    assert detail["overall"] == 0.0
+    for info in detail["sources"].values():
+        assert info["score"] == 0.0
+
+
+def test_compute_data_quality_backward_compatible_wrapper():
+    # compute_data_quality(digest) with no settings still returns just the
+    # float overall score -- existing call sites keep working unchanged.
+    assert compute_data_quality(FULL_DQ_DIGEST) == compute_data_quality_detail(FULL_DQ_DIGEST)["overall"]
 
 
 def test_cluster_gate_helper():

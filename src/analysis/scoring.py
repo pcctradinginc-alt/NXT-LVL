@@ -21,7 +21,39 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-ALL_SOURCES = ["edgar_capex", "github_trends", "jobs_hn", "arxiv_trends", "hn_buzz"]
+# All collectors that can, in principle, be credited as evidence for a
+# candidate. edgar_fts/edgar_language were added alongside source FAMILIES
+# below: they are SEC-filing collectors just like edgar_capex, so they need
+# to participate in the same-family dampening rule (see
+# DEFAULT_SOURCE_FAMILIES) to make that rule mean anything for the SEC
+# family.
+ALL_SOURCES = [
+    "edgar_capex",
+    "edgar_fts",
+    "edgar_language",
+    "github_trends",
+    "jobs_hn",
+    "arxiv_trends",
+    "hn_buzz",
+]
+
+# Source families (breadth fix): two credited sources are not automatically
+# two independent pieces of evidence. jobs_hn and hn_buzz are both Hacker
+# News (same community, often the same people); edgar_capex, edgar_fts and
+# edgar_language are all SEC filings (heavily correlated with each other).
+# `effective_source_count` below uses this grouping so that within one
+# family, only the FIRST credited source counts as full (1.0) independent
+# evidence — every additional source from that same family counts only
+# `within_family_weight`. Across families, credit stays full. Driven from
+# config.yaml (see Settings/main.py) so it stays tunable; these are the
+# fallback defaults when no config is supplied (e.g. direct unit tests).
+DEFAULT_SOURCE_FAMILIES: dict[str, list[str]] = {
+    "sec": ["edgar_capex", "edgar_fts", "edgar_language"],
+    "developers": ["github_trends"],
+    "hackernews": ["jobs_hn", "hn_buzz"],
+    "research": ["arxiv_trends"],
+}
+DEFAULT_WITHIN_FAMILY_WEIGHT = 0.35
 
 # Neutral emergence score used whenever a candidate has no associated
 # emergent theme (e.g. plain watchlist candidates) or no all_theme_scores
@@ -75,6 +107,22 @@ def _stage_keyed_value(block: dict[str, Any], key: str, stage_id: Any) -> Any:
     return sub.get(str(stage_id))
 
 
+def _candidate_theme_id(candidate: dict[str, Any]) -> Any:
+    """Look up a candidate's theme_id, preferring the top-level field.
+
+    Falls back to `candidate["discovery"]["theme_id"]`. Shared by
+    score_emergence and the edgar_fts stage/theme-active hook so both use
+    exactly the same lookup order.
+    """
+    theme_id = candidate.get("theme_id")
+    if theme_id is not None:
+        return theme_id
+    discovery = candidate.get("discovery")
+    if isinstance(discovery, dict):
+        return discovery.get("theme_id")
+    return None
+
+
 def _stage_active_sources(candidate: dict[str, Any], digest: dict[str, Any]) -> set[str]:
     """Sources showing non-zero signal for the candidate's stage in the digest.
 
@@ -119,6 +167,25 @@ def _stage_active_sources(candidate: dict[str, Any], digest: dict[str, Any]) -> 
     if edgar.get("aggregate_capex_yoy_pct") is not None:
         active.add("edgar_capex")
 
+    # edgar_fts is keyed by THEME, not stage, so it confirms a candidate
+    # only when the candidate is actually associated with a theme that shows
+    # real filing-frequency activity — unlike edgar_capex it is NOT credited
+    # stage-agnostically, since that would credit it for every candidate
+    # regardless of relevance.
+    theme_id = _candidate_theme_id(candidate)
+    if theme_id is not None:
+        fts = digest.get("edgar_fts") or {}
+        theme_count = (fts.get("theme_counts") or {}).get(theme_id)
+        if isinstance(theme_count, (int, float)) and theme_count > 0:
+            active.add("edgar_fts")
+
+    # edgar_language is keyed by (mega-cap) FILER ticker, not by stage or
+    # theme, and its configured company set is disjoint from the kind of
+    # small/mid-cap "next-stage beneficiary" tickers this system proposes as
+    # candidates (see megacap_exclude) — so there is no meaningful implicit
+    # stage/theme-active hook for it here. It can still be credited via an
+    # explicit `source_evidence` citation from the LLM.
+
     return active
 
 
@@ -137,10 +204,63 @@ def _credited_sources(
     return evidence | stage_active
 
 
+def _family_lookup(source_families: dict[str, list[str]]) -> dict[str, str]:
+    """Invert {family: [sources]} into {source: family} for O(1) lookup."""
+    lookup: dict[str, str] = {}
+    for family, members in source_families.items():
+        for src in members:
+            lookup[src] = family
+    return lookup
+
+
+def effective_source_count(
+    sources: set[str] | list[str],
+    source_families: dict[str, list[str]] | None = None,
+    within_family_weight: float = DEFAULT_WITHIN_FAMILY_WEIGHT,
+    reliability: dict[str, float] | None = None,
+) -> float:
+    """Effective (family-dampened) count of independent evidence sources.
+
+    Two credited sources from the SAME family are not two independent
+    confirmations: the first source credited from a family counts 1.0, and
+    every ADDITIONAL credited source from that same family counts only
+    `within_family_weight` (default 0.35). Sources from different families
+    each count in full. So e.g. `{"edgar_capex", "edgar_fts"}` (both "sec")
+    gives 1.35, while `{"edgar_capex", "github_trends"}` (different
+    families) gives 2.0 — exactly the point of the fix: same-family sources
+    should not trivially clear a 2-independent-source bar.
+
+    A source not listed in any family is treated as its own singleton
+    family (full 1.0 credit, same as before this fix existed). Iterates
+    sources in sorted order purely for a deterministic tie-break on which
+    member of a family is "first" when `reliability` differs between
+    members of the same family — the total absent `reliability` is order
+    independent.
+
+    `reliability` maps source name -> multiplier (default 1.0 for every
+    source when omitted), applied per-source on top of the family weight —
+    unrelated to (and composes with) the family dampening above.
+    """
+    source_families = source_families or DEFAULT_SOURCE_FAMILIES
+    lookup = _family_lookup(source_families)
+    reliability = reliability or {}
+
+    seen_families: set[str] = set()
+    total = 0.0
+    for src in sorted(set(sources)):
+        family = lookup.get(src, src)
+        base_weight = within_family_weight if family in seen_families else 1.0
+        seen_families.add(family)
+        total += base_weight * reliability.get(src, 1.0)
+    return total
+
+
 def score_breadth(
     candidate: dict[str, Any],
     digest: dict[str, Any],
     reliability: dict[str, float] | None = None,
+    source_families: dict[str, list[str]] | None = None,
+    within_family_weight: float = DEFAULT_WITHIN_FAMILY_WEIGHT,
 ) -> float:
     """Breadth score from real multi-source confirmation.
 
@@ -149,17 +269,21 @@ def score_breadth(
     the candidate's stage in the digest (see `_stage_active_sources`).
     Candidates with no `stage_id` fall back to source_evidence only.
 
+    Sources are combined via `effective_source_count` (family-dampened, see
+    its docstring) rather than a flat count, and normalized against the
+    maximum achievable effective count over ALL_SOURCES (crediting every
+    source, reliability=1.0) so the result stays 0-100 regardless of how
+    many families/sources exist.
+
     `reliability` maps source name -> multiplier (default 1.0 for every
     source when omitted, preserving the original unweighted behavior).
     """
     counted = _credited_sources(candidate, digest)
-
-    if not reliability:
-        return _clip(len(counted) / len(ALL_SOURCES) * 100)
-
-    weighted = sum(reliability.get(src, 1.0) for src in counted)
-    max_possible = len(ALL_SOURCES)  # reliability=1.0 ceiling per source
-    return _clip(weighted / max_possible * 100)
+    effective = effective_source_count(counted, source_families, within_family_weight, reliability)
+    max_effective = effective_source_count(ALL_SOURCES, source_families, within_family_weight, reliability=None)
+    if max_effective <= 0:
+        return 0.0
+    return _clip(effective / max_effective * 100)
 
 
 def score_emergence(
@@ -178,11 +302,7 @@ def score_emergence(
     if not all_theme_scores:
         return NEUTRAL_EMERGENCE_SCORE
 
-    theme_id = candidate.get("theme_id")
-    if theme_id is None:
-        discovery = candidate.get("discovery")
-        if isinstance(discovery, dict):
-            theme_id = discovery.get("theme_id")
+    theme_id = _candidate_theme_id(candidate)
 
     if theme_id is None:
         return NEUTRAL_EMERGENCE_SCORE
@@ -337,6 +457,8 @@ def score_candidate(
     option: dict[str, Any] | None = None,
     all_theme_scores: dict[str, float] | None = None,
     reliability: dict[str, float] | None = None,
+    source_families: dict[str, list[str]] | None = None,
+    within_family_weight: float = DEFAULT_WITHIN_FAMILY_WEIGHT,
 ) -> dict[str, Any]:
     """Score a single candidate. Returns candidate dict enriched with scores.
 
@@ -344,10 +466,20 @@ def score_candidate(
     Emergence & Reward Engine; omitting them reproduces the original
     (pre-emergence) scoring behavior exactly aside from the rebalanced
     DEFAULT_WEIGHTS, since score_emergence() is neutral (50) without theme data.
+
+    `source_families`/`within_family_weight` drive the breadth fix (see
+    `effective_source_count`); omitting them falls back to
+    DEFAULT_SOURCE_FAMILIES/DEFAULT_WITHIN_FAMILY_WEIGHT.
     """
     weights = weights or DEFAULT_WEIGHTS
 
-    breadth = score_breadth(candidate, digest, reliability=reliability)
+    breadth = score_breadth(
+        candidate,
+        digest,
+        reliability=reliability,
+        source_families=source_families,
+        within_family_weight=within_family_weight,
+    )
     momentum = score_momentum(candidate, digest)
     stage_fit = score_stage_fit(candidate, next_stage)
     divergence = score_divergence(three_month_perf_pct)
@@ -377,7 +509,18 @@ def score_candidate(
         "conviction_multiplier": round(multiplier, 3),
     }
     enriched["total_score"] = round(total_score, 1)
-    enriched["source_count"] = len(_credited_sources(candidate, digest))
+    # source_count is now the EFFECTIVE (family-dampened) count, not a raw
+    # len() — this is the whole point of the fix: two same-family sources
+    # (e.g. jobs_hn + hn_buzz) must not trivially clear a 2-source gate the
+    # way two independent sources would. Rounded to 2dp (not to the nearest
+    # int) so fractional values like 1.35 still correctly fail a `< 2` gate
+    # instead of rounding up to a misleading 2.
+    enriched["source_count"] = round(
+        effective_source_count(
+            _credited_sources(candidate, digest), source_families, within_family_weight, reliability
+        ),
+        2,
+    )
     return enriched
 
 
@@ -390,6 +533,8 @@ def score_candidates(
     option_lookup: dict[str, dict[str, Any] | None] | None = None,
     all_theme_scores: dict[str, float] | None = None,
     reliability: dict[str, float] | None = None,
+    source_families: dict[str, list[str]] | None = None,
+    within_family_weight: float = DEFAULT_WITHIN_FAMILY_WEIGHT,
 ) -> list[dict[str, Any]]:
     """Score all candidates and return them sorted by total_score descending."""
     perf_lookup = perf_lookup or {}
@@ -405,6 +550,8 @@ def score_candidates(
             option=option_lookup.get(candidate.get("ticker")),
             all_theme_scores=all_theme_scores,
             reliability=reliability,
+            source_families=source_families,
+            within_family_weight=within_family_weight,
         )
         for candidate in candidates
     ]

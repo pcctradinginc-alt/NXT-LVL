@@ -15,8 +15,11 @@ hard failures (e.g. cannot even load config) result in a non-zero exit code.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
+import os
+import subprocess
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -28,7 +31,7 @@ from src.analysis import insider as insider_mod
 from src.analysis import iv_rank
 from src.analysis import llm, phases, scoring, structures, trend
 from src.collectors import arxiv_trends, edgar_capex, edgar_fts, edgar_language, github_trends, hn_buzz, jobs_hn
-from src.config import DATA_DIR, Settings, load_settings
+from src.config import DATA_DIR, PROJECT_ROOT, Settings, load_settings
 from src.emergence import baseline as baseline_mod
 from src.emergence import detector as emergence_detector
 from src.mailer import build_email, send
@@ -148,6 +151,239 @@ def write_json(path: Path, data: Any) -> None:
         fh.write("\n")
 
 
+MAX_DIGEST_HISTORY_RECORD_BYTES = 20_000
+
+
+def _git_commit_sha() -> str | None:
+    """Best-effort code identity for the archival record.
+
+    Prefers the CI-provided `GITHUB_SHA` (exact, no subprocess needed on the
+    machine that actually produced the run), falls back to asking git
+    directly (useful for local/manual runs), falls back to None. Never
+    raises — this is purely a nice-to-have "what code produced this line"
+    marker, not something that should ever break the pipeline.
+    """
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        sha = (result.stdout or "").strip()
+        return sha or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _normalize_for_hash(obj: Any) -> Any:
+    """Recursively normalize dict keys to str before sorting.
+
+    config.yaml mixes int keys (e.g. `benchmarks: {1: SOXX, ...}`) and str
+    keys (`default: SPY`) in the same dict, which makes plain
+    `json.dumps(..., sort_keys=True)` raise (`'<' not supported between
+    instances of 'str' and 'int'`). Stringifying keys first sidesteps that
+    while still giving an order-independent, deterministic structure.
+    """
+    if isinstance(obj, dict):
+        return {str(k): _normalize_for_hash(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(obj, list):
+        return [_normalize_for_hash(v) for v in obj]
+    return obj
+
+
+def _config_hash(settings: Settings) -> str | None:
+    """Stable short hash of the entire config.yaml content.
+
+    Lets a later reader tell "was this run using the same config as that
+    other run" without diffing the whole file. Order-independent (keys are
+    normalized+sorted, see _normalize_for_hash) so cosmetic YAML
+    re-ordering doesn't change the hash.
+    """
+    try:
+        blob = json.dumps(_normalize_for_hash(settings.raw), ensure_ascii=False, default=str)
+        return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _key_thresholds(settings: Settings) -> dict[str, Any]:
+    """The handful of gate thresholds actually in force this run.
+
+    Kept separate from the full config hash because these are exactly the
+    numbers a later reader most wants without decoding a hash: did
+    signal_threshold/min_sources/min_data_quality/cluster settings change
+    between this run and an older one.
+    """
+    return {
+        "signal_threshold": settings.signal_threshold,
+        "min_sources": settings.min_sources,
+        "min_data_quality": settings.min_data_quality,
+        "cluster_min_members": settings.cluster_min_members,
+        "cluster_score_bar": settings.cluster_score_bar,
+    }
+
+
+def _universe_tickers(settings: Settings) -> list[str]:
+    """Sorted union of the 7-stage watchlist and every theme's ticker list.
+
+    This is "the universe of tickers the system could possibly have
+    surfaced today" — the point-in-time context needed to later distinguish
+    "the system didn't know about this ticker yet" from "the system knew
+    but didn't pick it".
+    """
+    tickers = set(settings.watchlist_tickers())
+    for theme in settings.themes:
+        tickers.update(str(t).upper() for t in (theme.get("tickers") or []) if t)
+    return sorted(tickers)
+
+
+def _last_digest_history_record(path: Path) -> dict[str, Any] | None:
+    """Best-effort read of the most recent record already in `path`.
+
+    Used only to decide whether the universe ticker list changed since last
+    time (so the full list is stored only on change, see
+    append_digest_history). Any failure (missing file, corrupt trailing
+    line, ...) is treated as "no previous record" rather than raised.
+    """
+    try:
+        if not path.exists():
+            return None
+        last_line: str | None = None
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    last_line = line
+        if not last_line:
+            return None
+        return json.loads(last_line)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _collector_headline_counts(digest: dict[str, Any]) -> dict[str, Any]:
+    """Raw per-source INPUT counts (not derived scores) for archival.
+
+    The whole point of this archive is reconstructing "what did the system
+    actually know that day" — the raw record counts collectors returned
+    (companies covered, repo count, comment count, paper count, buzz
+    stories/points, EDGAR FTS per-theme hit counts), not just the scores
+    derived from them.
+    """
+    edgar_capex_block = digest.get("edgar_capex") or {}
+    edgar_language_block = digest.get("edgar_language") or {}
+    edgar_fts_block = digest.get("edgar_fts") or {}
+    github_block = digest.get("github_trends") or {}
+    jobs_block = digest.get("jobs_hn") or {}
+    arxiv_block = digest.get("arxiv_trends") or {}
+    hn_block = digest.get("hn_buzz") or {}
+
+    stage_buzz = hn_block.get("stage_buzz") or {}
+
+    return {
+        "edgar_capex_companies_covered": len(edgar_capex_block.get("companies") or {}),
+        "edgar_capex_aggregate_yoy_pct": edgar_capex_block.get("aggregate_capex_yoy_pct"),
+        "edgar_language_companies_covered": len(edgar_language_block.get("companies") or {}),
+        "edgar_fts_theme_counts": dict(edgar_fts_block.get("theme_counts") or {}),
+        "github_repo_count": len(github_block.get("top_new_repos") or []),
+        "jobs_hn_total_comments": jobs_block.get("total_comments", 0),
+        "arxiv_paper_count": arxiv_block.get("paper_count"),
+        "hn_buzz_total_stories": sum(
+            (v.get("stories") or 0) for v in stage_buzz.values() if isinstance(v, dict)
+        ),
+        "hn_buzz_total_points": sum(
+            (v.get("points") or 0) for v in stage_buzz.values() if isinstance(v, dict)
+        ),
+    }
+
+
+def _option_snapshot(top_pick: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Point-in-time snapshot of the selected option contract for archival.
+
+    Whatever was captured at selection time (strike/expiry/DTE/delta/
+    bid-ask-mid/IV/open interest) — the option chain itself is NOT archived
+    (too large, and re-derivable is not the point; the fact that THIS
+    contract was selected THIS way is). None when no option was selected at
+    all (dry-run, no Tradier key, or no top_pick).
+    """
+    if not top_pick:
+        return None
+    option = top_pick.get("option")
+    if not option:
+        return None
+    return {
+        "occ_symbol": option.get("occ_symbol"),
+        "strike": option.get("strike"),
+        "expiration": option.get("expiration"),
+        "dte": option.get("dte"),
+        "delta": option.get("delta"),
+        "bid": option.get("bid"),
+        "ask": option.get("ask"),
+        "mid": option.get("mid"),
+        "iv": option.get("iv"),
+        "open_interest": option.get("open_interest"),
+        "spread_pct": option.get("spread_pct"),
+    }
+
+
+def _record_size_bytes(record: dict[str, Any]) -> int:
+    return len(json.dumps(record, ensure_ascii=False, default=str).encode("utf-8"))
+
+
+def _shrink_record_to_budget(record: dict[str, Any], budget: int = MAX_DIGEST_HISTORY_RECORD_BYTES) -> dict[str, Any]:
+    """Best-effort trim so the JSONL line stays roughly within `budget` bytes.
+
+    This file is committed to git daily, so an unbounded line size is a real
+    long-term cost. Strips optional/verbose fields in priority order (least
+    valuable for later reconstruction first) until it fits, or gives up
+    gracefully after the last step (still valid JSON, just possibly over
+    budget) — never raises, mirrors the fault-tolerance of the rest of this
+    function.
+    """
+    if _record_size_bytes(record) <= budget:
+        return record
+
+    trimmed = dict(record)
+
+    # 1. The full universe ticker list is the most re-derivable field (it's
+    # just the current config.yaml's watchlist+themes) — drop it first, the
+    # hash+count still identify whether it changed.
+    trimmed.pop("universe_tickers", None)
+    if _record_size_bytes(trimmed) <= budget:
+        return trimmed
+
+    # 2. Drop the raw per-theme EDGAR FTS breakdown (keep the rest of
+    # collector_counts, which is much smaller).
+    counts = trimmed.get("collector_counts")
+    if isinstance(counts, dict) and "edgar_fts_theme_counts" in counts:
+        trimmed["collector_counts"] = {k: v for k, v in counts.items() if k != "edgar_fts_theme_counts"}
+    if _record_size_bytes(trimmed) <= budget:
+        return trimmed
+
+    # 3. Cap the candidates list to the top-ranked ones (already sorted
+    # descending by total_score) — they matter most for the forward IC
+    # calibration; a long tail of low-score candidates is the least useful
+    # part to keep growing the file.
+    candidates = trimmed.get("candidates")
+    if isinstance(candidates, list) and len(candidates) > 20:
+        trimmed["candidates"] = candidates[:20]
+    if _record_size_bytes(trimmed) <= budget:
+        return trimmed
+
+    # 4. Reduce the data-quality breakdown to just the overall number.
+    dq = trimmed.get("data_quality")
+    if isinstance(dq, dict) and "sources" in dq:
+        trimmed["data_quality"] = {"overall": dq.get("overall")}
+
+    return trimmed
+
+
 def append_digest_history(
     path: Path,
     *,
@@ -158,23 +394,40 @@ def append_digest_history(
     all_theme_scores: dict[str, float] | None,
     emergent_themes: list[dict[str, Any]] | None,
     run_date: str | None = None,
+    settings: Settings | None = None,
+    digest: dict[str, Any] | None = None,
+    perf_lookup: dict[str, float | None] | None = None,
+    data_quality_detail: dict[str, Any] | None = None,
+    effective_weights: dict[str, float] | None = None,
+    calibration_status: str | None = None,
 ) -> None:
-    """Append one compact JSON line summarizing this run to `path`.
+    """Append one JSON line summarizing this run to `path`.
 
     This is the substrate for a real FORWARD backtest: a true retroactive
     backtest of the collector-driven signal logic is impossible (the free
     data sources are point-in-time and were never archived), but archiving
     each run's scores now lets src/backtest/calibrate.py measure, once
     enough history has accumulated, which scoring components actually
-    predicted forward returns.
+    predicted forward returns. Because that reconstruction is only as good
+    as what was captured, this also records enough point-in-time context
+    (code identity, config identity, universe version, raw collector
+    counts, prices, option snapshot, data-quality breakdown, effective
+    weights, calibration status) to answer "what did the system actually
+    know that day" later — not just its scores.
 
-    Deliberately compact (a few KB per line, NOT the full raw digest) so the
-    file stays cheap to commit daily. Fault-tolerant: any failure here is
-    logged and swallowed, never allowed to break the pipeline. Runs in ALL
-    modes, including dry-run, so offline tests exercise this path too.
+    All of the new context above is OPTIONAL (defaults to None) and simply
+    omitted from the record when not supplied, so existing callers/tests
+    that only pass the original fields keep working unchanged.
+
+    Deliberately kept to a sane size (roughly
+    MAX_DIGEST_HISTORY_RECORD_BYTES = 20KB per line, NOT the full raw
+    digest) so the file stays cheap to commit daily — see
+    _shrink_record_to_budget. Fault-tolerant: any failure here is logged and
+    swallowed, never allowed to break the pipeline. Runs in ALL modes,
+    including dry-run, so offline tests exercise this path too.
     """
     try:
-        record = {
+        record: dict[str, Any] = {
             "date": run_date or date.today().isoformat(),
             "current_stage": current_stage,
             "next_stage": next_stage,
@@ -201,6 +454,52 @@ def append_digest_history(
             "all_theme_scores": all_theme_scores or {},
             "emergent_themes": [t.get("theme_id") for t in (emergent_themes or []) if t.get("theme_id")],
         }
+
+        # Code identity.
+        record["git_commit_sha"] = _git_commit_sha()
+
+        # Config identity: a stable hash of the whole file, plus the
+        # handful of thresholds actually in force this run.
+        if settings is not None:
+            record["config_hash"] = _config_hash(settings)
+            record["config_thresholds"] = _key_thresholds(settings)
+
+            # Universe version: hash + count always; the full ticker list
+            # only when it changed since the previous record, so a stable
+            # watchlist doesn't re-write the same list every single day.
+            universe = _universe_tickers(settings)
+            universe_hash = hashlib.sha256(",".join(universe).encode("utf-8")).hexdigest()[:16]
+            record["universe_hash"] = universe_hash
+            record["universe_count"] = len(universe)
+            previous = _last_digest_history_record(path)
+            if not previous or previous.get("universe_hash") != universe_hash:
+                record["universe_tickers"] = universe
+
+        # Raw collector counts: the inputs, not just the derived scores.
+        if digest is not None:
+            record["collector_counts"] = _collector_headline_counts(digest)
+
+        # Prices: the 3-month performance/quote data already fetched for
+        # candidates this run.
+        if perf_lookup:
+            record["perf_lookup"] = dict(perf_lookup)
+
+        # Option snapshot at selection time (None when no option/top_pick).
+        option_snapshot = _option_snapshot(top_pick)
+        if option_snapshot is not None:
+            record["option_snapshot"] = option_snapshot
+
+        # Data-quality breakdown, effective weights actually used this run,
+        # and the validation-gate calibration status.
+        if data_quality_detail is not None:
+            record["data_quality"] = data_quality_detail
+        if effective_weights is not None:
+            record["effective_weights"] = dict(effective_weights)
+        if calibration_status is not None:
+            record["calibration_status"] = calibration_status
+
+        record = _shrink_record_to_budget(record, budget=MAX_DIGEST_HISTORY_RECORD_BYTES)
+
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False, default=str))
@@ -209,34 +508,180 @@ def append_digest_history(
         logger.warning("append_digest_history failed, continuing: %s", exc)
 
 
-DIGEST_SOURCES = ["edgar_capex", "github_trends", "jobs_hn", "arxiv_trends", "hn_buzz", "edgar_fts"]
+DIGEST_SOURCES = [
+    "edgar_capex",
+    "edgar_fts",
+    "edgar_language",
+    "github_trends",
+    "jobs_hn",
+    "arxiv_trends",
+    "hn_buzz",
+]
+
+# Fallback data-quality expectations — see config.yaml's `data_quality`
+# block, which is the tunable source of truth. These constants are only
+# used when compute_data_quality[_detail] is called without a `settings`
+# object (e.g. a plain unit test exercising the digest math in isolation).
+DEFAULT_DQ_EXPECTED_VOLUME: dict[str, float] = {
+    "arxiv_trends": 200,  # arXiv Atom feed MAX_RESULTS
+    "jobs_hn": 300,  # "who is hiring" comment volume once AI hiring is active
+    "github_trends": 20,  # GitHub search page size (top_new_repos cap)
+    "hn_buzz": 20,  # HN buzz story count summed across stages
+}
+DEFAULT_DQ_EXPECTED_COMPANIES: dict[str, float] = {
+    "edgar_capex": 6,
+    "edgar_language": 6,
+}
+DEFAULT_DQ_EXPECTED_STAGES = 7
+DEFAULT_DQ_EXPECTED_THEMES = 11
 
 
-def compute_data_quality(digest: dict[str, Any]) -> float:
+def _dq_expectations(settings: Settings | None) -> dict[str, Any]:
+    """Resolve data-quality baselines from config.yaml (via `settings`), or
+    fall back to the DEFAULT_DQ_* constants above when no settings object is
+    supplied at all (keeps compute_data_quality unit-testable in isolation).
+    """
+    if settings is not None:
+        cfg = settings.raw.get("data_quality", {}) or {}
+        stages = len(settings.stages) or DEFAULT_DQ_EXPECTED_STAGES
+        themes = len(settings.themes) or DEFAULT_DQ_EXPECTED_THEMES
+    else:
+        cfg = {}
+        stages = DEFAULT_DQ_EXPECTED_STAGES
+        themes = DEFAULT_DQ_EXPECTED_THEMES
+    return {
+        "volume": {**DEFAULT_DQ_EXPECTED_VOLUME, **(cfg.get("expected_volume") or {})},
+        "companies": {**DEFAULT_DQ_EXPECTED_COMPANIES, **(cfg.get("expected_companies") or {})},
+        "stages": stages,
+        "themes": themes,
+    }
+
+
+def _dq_ratio(actual: float, expected: float) -> float:
+    """actual/expected mapped to [0, 100]; an expectation of 0 is treated as
+
+    "nothing to fall short of" (neutral 100) rather than a division error.
+    """
+    if not expected:
+        return 100.0
+    return max(0.0, min(100.0, actual / expected * 100))
+
+
+def _dq_degradation_penalty(block: dict[str, Any], score: float) -> tuple[float, bool]:
+    """Apply a penalty if the collector recorded an explicit degradation.
+
+    Collectors don't currently set this, but the hook is deliberately cheap
+    to honor: any future collector that adds a truthy `degraded` flag or a
+    non-empty `errors` list to its result dict (a fault-tolerant, additive
+    change, never altering existing collector logic) is automatically
+    reflected here without another src/main.py change.
+    """
+    degraded = bool(block.get("degraded")) or bool(block.get("errors"))
+    if degraded:
+        return min(score, 50.0), True
+    return score, False
+
+
+def _source_quality(source: str, digest: dict[str, Any], expected: dict[str, Any]) -> dict[str, Any]:
+    """Per-source data-quality sub-scores + aggregate score (0-100).
+
+    Builds presence / volume-vs-expectation / coverage sub-scores from
+    whatever that specific collector's output actually contains (see each
+    collector in src/collectors/ for the exact shape), rather than the old
+    one-size-fits-all "did it return any truthy value" heuristic. Missing
+    sub-scores (e.g. no volume concept for a given source) are simply
+    omitted from that source's mean, not faked as 0 or 100.
+    """
+    block = digest.get(source)
+    if not block:
+        return {"presence": 0.0, "score": 0.0, "degraded": False, "note": "no data returned"}
+
+    sub: dict[str, float] = {}
+
+    if source == "edgar_capex":
+        companies = block.get("companies") or {}
+        sub["presence"] = 100.0 if companies else 0.0
+        sub["coverage"] = _dq_ratio(len(companies), expected["companies"].get("edgar_capex", 6))
+        sub["aggregate_present"] = 100.0 if block.get("aggregate_capex_yoy_pct") is not None else 40.0
+    elif source == "edgar_language":
+        companies = block.get("companies") or {}
+        sub["presence"] = 100.0 if companies else 0.0
+        sub["coverage"] = _dq_ratio(len(companies), expected["companies"].get("edgar_language", 6))
+    elif source == "edgar_fts":
+        theme_counts = block.get("theme_counts") or {}
+        attempted = len(theme_counts)
+        sub["presence"] = 100.0 if theme_counts else 0.0
+        # Coverage: themes actually queried vs. configured — a request-budget
+        # cutoff (MAX_REQUESTS) or crash shows up as attempted << configured.
+        sub["coverage"] = _dq_ratio(attempted, expected["themes"])
+        if attempted:
+            hits = sum(1 for v in theme_counts.values() if v)
+            sub["signal_density"] = _dq_ratio(hits, attempted)
+    elif source == "github_trends":
+        repos = block.get("top_new_repos") or []
+        stage_heat = block.get("stage_heat") or {}
+        sub["presence"] = 100.0 if (repos or stage_heat) else 0.0
+        sub["volume"] = _dq_ratio(len(repos), expected["volume"].get("github_trends", 20))
+        sub["coverage"] = _dq_ratio(len(stage_heat), expected["stages"])
+    elif source == "jobs_hn":
+        stage_counts = block.get("stage_job_counts") or {}
+        total_comments = block.get("total_comments", 0) or 0
+        sub["presence"] = 100.0 if (stage_counts or total_comments) else 0.0
+        sub["volume"] = _dq_ratio(total_comments, expected["volume"].get("jobs_hn", 300))
+        sub["coverage"] = _dq_ratio(len(stage_counts), expected["stages"])
+    elif source == "arxiv_trends":
+        stage_counts = block.get("stage_paper_counts") or {}
+        paper_count = block.get("paper_count")
+        if paper_count is None:
+            # Older/offline digests captured before this field existed —
+            # fall back to a coarse proxy rather than losing the sub-score.
+            paper_count = sum(stage_counts.values()) if stage_counts else 0
+        sub["presence"] = 100.0 if (stage_counts or paper_count) else 0.0
+        sub["volume"] = _dq_ratio(paper_count, expected["volume"].get("arxiv_trends", 200))
+    elif source == "hn_buzz":
+        stage_buzz = block.get("stage_buzz") or {}
+        total_stories = sum((v.get("stories") or 0) for v in stage_buzz.values() if isinstance(v, dict))
+        sub["presence"] = 100.0 if stage_buzz else 0.0
+        sub["volume"] = _dq_ratio(total_stories, expected["volume"].get("hn_buzz", 20))
+        sub["coverage"] = _dq_ratio(len(stage_buzz), expected["stages"])
+    else:
+        has_data = any(v for k, v in block.items() if k != "source" and v not in (None, {}, [], "", 0))
+        sub["presence"] = 100.0 if has_data else 0.0
+
+    score = round(sum(sub.values()) / len(sub), 1) if sub else 0.0
+    score, degraded = _dq_degradation_penalty(block, score)
+    detail = dict(sub)
+    detail["score"] = score
+    detail["degraded"] = degraded
+    return detail
+
+
+def compute_data_quality_detail(digest: dict[str, Any], settings: Settings | None = None) -> dict[str, Any]:
+    """Per-source data-quality breakdown + an aggregate 0-100 score.
+
+    Replaces the old one-number-only compute_data_quality with something
+    diagnosable: "the API returned some number" should not automatically
+    mean "good data" — a source that covered 3/6 companies, or returned far
+    fewer records than expected, now visibly scores worse than one that
+    didn't. Returns {"overall": float, "sources": {source: {...}}}. The
+    overall score is the mean of every configured source's own score
+    (missing sources score 0, same as before — they still drag the average
+    down rather than being skipped).
+    """
+    expected = _dq_expectations(settings)
+    sources = {source: _source_quality(source, digest, expected) for source in DIGEST_SOURCES}
+    overall = round(sum(s["score"] for s in sources.values()) / len(sources), 1) if sources else 0.0
+    return {"overall": overall, "sources": sources}
+
+
+def compute_data_quality(digest: dict[str, Any], settings: Settings | None = None) -> float:
     """Deterministic 0-100 data-quality score from the digest.
 
-    Combines: share of sources that returned any non-empty data, whether
-    edgar_capex has a usable aggregate figure, and HN "who is hiring" comment
-    volume (a proxy for whether that collector was rate-limited/degraded).
+    Thin backward-compatible wrapper around compute_data_quality_detail()
+    (see its docstring) for callers that only need the single overall
+    number, e.g. the min_data_quality gate.
     """
-    active = 0
-    for source in DIGEST_SOURCES:
-        block = digest.get(source)
-        if not block:
-            continue
-        has_data = any(v for k, v in block.items() if k != "source" and v not in (None, {}, [], "", 0))
-        if has_data:
-            active += 1
-    source_completeness = active / len(DIGEST_SOURCES) * 100
-
-    edgar = digest.get("edgar_capex") or {}
-    capex_ok = 100.0 if edgar.get("aggregate_capex_yoy_pct") is not None else 40.0
-
-    jobs = digest.get("jobs_hn") or {}
-    total_comments = jobs.get("total_comments", 0) or 0
-    comment_volume_score = max(0.0, min(100.0, total_comments / 500 * 100))
-
-    return round((source_completeness + capex_ok + comment_volume_score) / 3, 1)
+    return compute_data_quality_detail(digest, settings=settings)["overall"]
 
 
 def _ticker_tradeable(tradier: Any, ticker: str) -> bool:
@@ -566,6 +1011,18 @@ def run(dry_run: bool = False) -> int:
     write_json(LAST_DIGEST_PATH, digest)
     logger.info("Digest written to %s", LAST_DIGEST_PATH)
 
+    # 2c. Data-quality breakdown (#17 follow-up): computed once, up front, so
+    # the gate check, the top-pick risk flags, and the forward archival
+    # record (step 12b) all see the exact same per-source numbers for this
+    # run instead of three independently-recomputed (and possibly
+    # inconsistent) calls.
+    data_quality_detail = compute_data_quality_detail(digest, settings=settings)
+    logger.info(
+        "Data quality this run: overall=%.1f, per-source=%s",
+        data_quality_detail["overall"],
+        {src: info.get("score") for src, info in data_quality_detail["sources"].items()},
+    )
+
     # 3. Tradier client (used for tracking evaluation, divergence, and option selection)
     tradier_client: TradierClient | None = None
     if not dry_run and settings.tradier_api_key:
@@ -628,6 +1085,16 @@ def run(dry_run: bool = False) -> int:
     effective_weights = weights_mod.get_effective_weights(settings.scoring_weights, WEIGHTS_PATH)
     effective_reliability = weights_mod.current_reliability(weights_obj)
     all_theme_scores = emergence_result.get("all_theme_scores", {})
+
+    # Source families (breadth fix): config.yaml-driven grouping of
+    # correlated collectors (SEC filings, Hacker News, ...) so score_breadth
+    # dampens same-family sources instead of treating them as independent
+    # confirmation. Falls back to scoring.DEFAULT_SOURCE_FAMILIES when
+    # config.yaml doesn't define the block at all.
+    source_families = settings.scoring.get("source_families") or scoring.DEFAULT_SOURCE_FAMILIES
+    within_family_weight = float(
+        settings.scoring.get("within_family_weight", scoring.DEFAULT_WITHIN_FAMILY_WEIGHT)
+    )
 
     # Phase D validation-gate weights (CONCEPT_PROFIT.md): read once here and
     # reused by the validation gate further below (avoids reading the file
@@ -780,6 +1247,8 @@ def run(dry_run: bool = False) -> int:
         perf_lookup=perf_lookup,
         all_theme_scores=all_theme_scores,
         reliability=effective_reliability,
+        source_families=source_families,
+        within_family_weight=within_family_weight,
     )
 
     # 8b. Machine-checkable-claims verification (#18): dampen each
@@ -838,7 +1307,7 @@ def run(dry_run: bool = False) -> int:
     # wastes an option-chain lookup or gets emitted as a signal.
     no_signal_reason: str | None = None
     if top_pick is not None:
-        dq = compute_data_quality(digest)
+        dq = data_quality_detail["overall"]
         if dq < settings.min_data_quality:
             no_signal_reason = (
                 f"Datenqualität zu niedrig ({dq}/100, Minimum {settings.min_data_quality}) "
@@ -1063,6 +1532,8 @@ def run(dry_run: bool = False) -> int:
                 option=option,
                 all_theme_scores=all_theme_scores,
                 reliability=effective_reliability,
+                source_families=source_families,
+                within_family_weight=within_family_weight,
             )
             # Re-apply the claims dampening (#18) — score_candidate() above
             # recomputed a fresh total_score that doesn't carry the earlier
@@ -1083,7 +1554,7 @@ def run(dry_run: bool = False) -> int:
         top_pick["earnings_trap"] = bool(earnings_trap)
 
         # 11. Risk flags (rendered by the mailer, computed here).
-        data_quality_score = compute_data_quality(digest)
+        data_quality_score = data_quality_detail["overall"]
         risks = compute_risks(
             top_pick,
             option,
@@ -1255,6 +1726,12 @@ def run(dry_run: bool = False) -> int:
         scored_candidates=scored,
         all_theme_scores=all_theme_scores,
         emergent_themes=emergence_result.get("emergent_themes", []),
+        settings=settings,
+        digest=digest,
+        perf_lookup=perf_lookup,
+        data_quality_detail=data_quality_detail,
+        effective_weights=effective_weights,
+        calibration_status=calibration_status,
     )
 
     # 13. Build + send/write email
